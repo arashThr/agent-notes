@@ -1,6 +1,6 @@
 ;;; agent-notes.el --- Review git changes with an AI agent using inline notes -*- lexical-binding: t; -*-
 
-;; Version: 0.3.0
+;; Version: 0.4.0
 ;; Package-Requires: ((emacs "29.1") (magit-section "4.0") (transient "0.7"))
 ;; Keywords: tools, vc, convenience
 
@@ -9,14 +9,17 @@
 ;;; Commentary:
 
 ;; Agent Notes lets you go through the changes in a git repository
-;; together with an AI agent (GitHub Copilot CLI), using notes attached
-;; to lines of a read-only diff.
+;; together with an AI agent (GitHub Copilot CLI, Claude Code or the
+;; Codex CLI; see `agent-notes-agent'), using notes attached to lines
+;; of a read-only diff.
 ;;
-;; - M-x agent-notes-review   Snapshot the working tree (or the current
-;;                            branch vs. a base branch) and give the
-;;                            agent a task: a bug review, an overview of
-;;                            the important changes, a diagram, or your
-;;                            own instructions.  Its notes appear inline.
+;; - M-x agent-notes-review   Snapshot the changes (the working tree,
+;;                            the staged changes, the current branch vs.
+;;                            a base branch, a commit or a range) and
+;;                            give the agent a task: a bug review, an
+;;                            overview of the important changes, a
+;;                            diagram, or your own instructions.  Its
+;;                            notes appear inline.
 ;; - M-x agent-notes-open     Reopen a previous review.
 ;; - M-x agent-notes-menu     All of the above in a menu.  In Magit it is
 ;;                            on `@', and in `magit-dispatch'.
@@ -27,7 +30,7 @@
 ;; notes, add your own notes, reply to the agent, edit or delete your
 ;; unsent comments and resolve threads.  Your comments are queued;
 ;; press `s' to send all of them to the agent in one go.  The agent
-;; answers in the same Copilot session, so it remembers the review.
+;; answers in the same session, so it remembers the review.
 ;; When you ask it to change code, it edits the files and the diff is
 ;; refreshed, with the notes moving along with the code.  The same
 ;; happens when you edit and save a file yourself.  Press `?' for all
@@ -40,7 +43,7 @@
 ;; - agent-notes-diff.el    git, diff parsing, anchoring, syntax highlighting
 ;; - agent-notes-render.el  drawing the review buffer
 ;; - agent-notes-log.el     the log of a review
-;; - agent-notes-agent.el   prompts, running Copilot, applying answers
+;; - agent-notes-agent.el   prompts, running the agent, applying answers
 ;; - agent-notes-magit.el   Magit integration, loaded with Magit
 ;; - agent-notes.el         the mode, commands, menus and entry points
 
@@ -370,7 +373,10 @@ Graphviz source instead."
     (pop-to-buffer (current-buffer))))
 
 (defun agent-notes--visit-code ()
-  "Open the file of the line or note at point, at that line."
+  "Open the file of the line or note at point, at that line.
+When the file no longer has the line's code at that line number, for
+example in a review of an older commit, go to the nearest line that
+has it."
   (let* ((note (and (get-text-property (point) 'agent-notes-note) (agent-notes--note-at-point)))
          (rec (if note
                   (gethash (plist-get note :id) agent-notes--placement)
@@ -378,6 +384,9 @@ Graphviz source instead."
          (path (if note (plist-get note :path) (plist-get rec :path)))
          (line (cond ((and note (equal (plist-get note :side) "new")) (plist-get note :line))
                      (rec (plist-get rec :new))))
+         (text (and rec line (memq (plist-get rec :kind) '(context added))
+                    (eql (plist-get rec :new) line)
+                    (agent-notes--content rec)))
          (file (and path (not (string-empty-p path))
                     (expand-file-name path (plist-get agent-notes--review :root)))))
     (unless file (user-error "Nothing to visit here"))
@@ -385,6 +394,12 @@ Graphviz source instead."
     (find-file-other-window file)
     (when (and line (> line 0))
       (widen)
+      (when (and text (not (string-blank-p text)))
+        (setq line (or (agent-notes--locate-lines
+                        (agent-notes--split-lines
+                         (buffer-substring-no-properties (point-min) (point-max)))
+                        (list text) line)
+                       line)))
       (goto-char (point-min))
       (forward-line (1- line)))))
 
@@ -570,6 +585,29 @@ own instructions."
       (kill-process agent-notes--process)
     (user-error "The agent is not running")))
 
+(defun agent-notes-choose-agent (agent)
+  "Use AGENT, a key of `agent-notes-agents', for the next requests.
+This sets `agent-notes-agent' for this Emacs session; customize it
+to keep the choice.  A review that used another agent starts a new
+session with AGENT."
+  (interactive
+   (let* ((candidates (mapcar (lambda (agent)
+                                (cons (format "%s (%s)" (agent-notes--agent-name agent)
+                                              (agent-notes--agent-program agent))
+                                      (car agent)))
+                              agent-notes-agents))
+          (current (car (rassq agent-notes-agent candidates))))
+     (list (cdr (assoc (completing-read (format-prompt "Agent" current)
+                                        (agent-notes--completion-table candidates)
+                                        nil t nil nil current)
+                       candidates)))))
+  (setq agent-notes-agent agent)
+  (message "Agent Notes now uses %s" (agent-notes--agent-name)))
+
+(defun agent-notes--choose-agent-description ()
+  "Describe `agent-notes-choose-agent' in menus."
+  (format "Agent: %s" (propertize (agent-notes--agent-name) 'face 'transient-value)))
+
 ;;;; Menus
 
 (transient-define-prefix agent-notes-dispatch ()
@@ -594,6 +632,7 @@ own instructions."
    ["Agent"
     ("s" "Send unsent comments" agent-notes-send)
     ("A" "Give a task…" agent-notes-request-review)
+    ("@" agent-notes-choose-agent :description agent-notes--choose-agent-description)
     ("x" "Abort" agent-notes-abort)
     ("$" "What is happening (log)" agent-notes-show-log)]
    ["View"
@@ -609,11 +648,16 @@ own instructions."
 ;;;###autoload (autoload 'agent-notes-menu "agent-notes" nil t)
 (transient-define-prefix agent-notes-menu ()
   "Review the changes in the current repository with an agent."
-  ["Agent notes"
-   ("w" "Review working tree…" agent-notes-review-working-tree)
-   ("b" "Review branch…" agent-notes-review-branch)
-   ("l" "Open latest review" agent-notes-open-latest)
-   ("o" "Open a review…" agent-notes-open)])
+  [["Review"
+    ("w" "Working tree…" agent-notes-review-working-tree)
+    ("s" "Staged changes…" agent-notes-review-staged)
+    ("b" "Branch…" agent-notes-review-branch)
+    ("c" "Commit or range…" agent-notes-review-commit)]
+   ["Open"
+    ("l" "Latest review" agent-notes-open-latest)
+    ("o" "A review…" agent-notes-open)]
+   ["Agent"
+    ("a" agent-notes-choose-agent :description agent-notes--choose-agent-description)]])
 
 ;;;; Mode
 
@@ -643,6 +687,7 @@ own instructions."
   "#" #'agent-notes-toggle-line-numbers
   "g" #'agent-notes-refresh
   "$" #'agent-notes-show-log
+  "@" #'agent-notes-choose-agent
   "x" #'agent-notes-abort
   "C-c C-k" #'agent-notes-abort
   "?" #'agent-notes-dispatch
@@ -678,15 +723,48 @@ all with \\[agent-notes-send].  Press \\[agent-notes-dispatch] for a menu of all
     (completing-read (format-prompt "Base branch" default)
                      (agent-notes--branches) nil nil nil nil default)))
 
+(declare-function magit-commit-at-point "magit-git" ())
+
+(defvar agent-notes--rev-history nil
+  "History of commits and ranges given to `agent-notes-review-commit'.")
+
+(defun agent-notes--rev-at-point ()
+  "Return the commit at point, or a range of the commits in the region.
+This works in Magit buffers such as the log; elsewhere return nil."
+  (let ((revs (ignore-errors (magit-region-values '(commit) t))))
+    (cond ((cdr revs)
+           (deactivate-mark)
+           ;; Magit lists the newest first; include the oldest commit too.
+           (format "%s^..%s" (car (last revs)) (car revs)))
+          (revs (car revs))
+          ((fboundp 'magit-commit-at-point)
+           (ignore-errors (magit-commit-at-point))))))
+
+(defun agent-notes--read-commit-or-range ()
+  "Read a commit, or a range A..B or A...B."
+  (let* ((default (or (agent-notes--rev-at-point) "HEAD"))
+         (rev (string-trim
+               (completing-read (format-prompt "Commit, or range A..B or A...B" default)
+                                (agent-notes--branches) nil nil nil
+                                'agent-notes--rev-history default))))
+    (if (string-empty-p rev) default rev)))
+
+(defun agent-notes--commit-scope (rev)
+  "Return (SCOPE BASE) for REV, a commit or a range."
+  (list (if (agent-notes--parse-range rev) "range" "commit") rev))
+
 (defun agent-notes--read-scope ()
   "Read the scope of a new review; return (SCOPE BASE)."
-  (let* ((working "Working tree: uncommitted changes vs HEAD")
-         (choice (completing-read "Review: "
-                                  (list working "Branch: all changes since a base branch")
-                                  nil t nil nil working)))
-    (if (equal choice working)
-        (list "working" nil)
-      (list "branch" (agent-notes--read-base)))))
+  (let* ((choices '(("Working tree: uncommitted changes vs HEAD" . "working")
+                    ("Staged: the staged changes vs HEAD" . "staged")
+                    ("Branch: all changes since a base branch" . "branch")
+                    ("Commit or range: a commit, or A..B" . "commit")))
+         (choice (completing-read "Review: " (agent-notes--completion-table choices)
+                                  nil t nil nil (caar choices))))
+    (pcase (cdr (assoc choice choices))
+      ("branch" (list "branch" (agent-notes--read-base)))
+      ("commit" (agent-notes--commit-scope (agent-notes--read-commit-or-range)))
+      (scope (list scope nil)))))
 
 (defun agent-notes--create-review (scope base)
   "Snapshot the changes in SCOPE and BASE as a new review.
@@ -696,12 +774,20 @@ Return its review buffer."
     (pcase-let ((`(,diff ,base-label ,base-rev ,head) (agent-notes--make-diff scope base)))
       (when (string-blank-p diff)
         (user-error "No changes to review"))
-      (let* ((id (format-time-string "%Y%m%d-%H%M%S"))
-             (dir (agent-notes--directory))
+      (let* ((dir (agent-notes--directory))
+             (id (let* ((stamp (format-time-string "%Y%m%d-%H%M%S"))
+                        (id stamp)
+                        (n 1))
+                   (while (file-exists-p (expand-file-name (concat id ".json") dir))
+                     (setq n (1+ n) id (format "%s-%d" stamp n)))
+                   id))
              (file (expand-file-name (concat id ".json") dir))
              (review (list :version 2 :id id :root root :scope scope
                            :base base-label :base_rev base-rev :head_rev head
+                           :subject (and (equal scope "commit")
+                                         (agent-notes--git-try "log" "-1" "--format=%s" head))
                            :created (format-time-string "%F %R")
+                           :agent (symbol-name agent-notes-agent)
                            :session (agent-notes--uuid)
                            :next_note 1 :next_comment 1 :summaries nil :notes nil)))
         (make-directory dir t)
@@ -719,10 +805,11 @@ Return its review buffer."
 ;;;###autoload
 (defun agent-notes-review (scope &optional base task)
   "Snapshot the changes in SCOPE and give the agent TASK on them.
-SCOPE is \"working\" for uncommitted changes against HEAD, or
-\"branch\" for everything since the current branch forked from BASE.
-TASK is a (NAME . INSTRUCTIONS); it defaults to the first entry of
-`agent-notes-tasks'."
+SCOPE is \"working\" for uncommitted changes against HEAD, \"staged\"
+for the staged changes, \"branch\" for everything since the current
+branch forked from BASE, \"commit\" for the commit BASE, or \"range\"
+for the range BASE (A..B or A...B).  TASK is a (NAME . INSTRUCTIONS);
+it defaults to the first entry of `agent-notes-tasks'."
   (interactive (let ((default-directory (agent-notes--root)))
                  (append (agent-notes--read-scope) (list (agent-notes--read-task)))))
   (let* ((task (or task (car agent-notes-tasks)
@@ -739,11 +826,28 @@ TASK is a (NAME . INSTRUCTIONS); it defaults to the first entry of
   (agent-notes-review "working" nil task))
 
 ;;;###autoload
+(defun agent-notes-review-staged (task)
+  "Give the agent TASK on the staged changes of the repository."
+  (interactive (progn (agent-notes--root) (list (agent-notes--read-task))))
+  (agent-notes-review "staged" nil task))
+
+;;;###autoload
 (defun agent-notes-review-branch (base task)
   "Give the agent TASK on all changes since the current branch forked from BASE."
   (interactive (let ((default-directory (agent-notes--root)))
                  (list (agent-notes--read-base) (agent-notes--read-task))))
   (agent-notes-review "branch" base task))
+
+;;;###autoload
+(defun agent-notes-review-commit (rev task)
+  "Give the agent TASK on the changes of the commit REV.
+REV may also be a range: A..B for the changes from A to B, or A...B
+for the changes on B since it forked from A.  In a Magit log, the
+default is the commit at point, or the commits in the region.
+The agent edits the working tree, which may differ from REV."
+  (interactive (let ((default-directory (agent-notes--root)))
+                 (list (agent-notes--read-commit-or-range) (agent-notes--read-task))))
+  (apply #'agent-notes-review (append (agent-notes--commit-scope rev) (list task))))
 
 ;;;###autoload
 (defun agent-notes-open ()

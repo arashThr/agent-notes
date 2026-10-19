@@ -650,7 +650,7 @@ point.  SYNTAX is as in `agent-notes--code-line'."
                   (propertize (format "  ·  %d unsent (s to send)" unsent)
                               'face 'agent-notes-pending)
                 "")
-              "  ·  Agent: "
+              (format "  ·  %s: " (agent-notes--agent-name))
               (if agent-notes--status
                   (propertize (format "%s %s" agent-notes--status (or (agent-notes--elapsed) ""))
                               'face 'agent-notes-pending)

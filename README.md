@@ -1,6 +1,6 @@
 # agent-notes
 
-Go through the changes in a git repository with an AI agent (GitHub Copilot CLI), inside Emacs.
+Go through the changes in a git repository with an AI agent (GitHub Copilot CLI, Claude Code or the Codex CLI), inside Emacs.
 
 The diff is shown in a Magit-style buffer, unified or side by side, with the syntax highlighting of each file's major mode. You give the agent a task, such as a bug review, an overview of the important changes, a diagram, or your own instructions. Its notes appear under the lines they refer to. You can reply, add your own notes, and resolve threads. Your comments are queued, and nothing goes to the agent until you send them all with `s`. If you ask for a change, the agent edits the code; when it suggests a change in a note, `a` applies it. You can also edit files yourself. Either way, the diff refreshes and the notes move with the code.
 
@@ -23,7 +23,10 @@ stats.py
 
 - Emacs 29.1 or newer
 - `magit-section` and `transient`, which come with Magit. Magit itself is optional; it adds the integration described below.
-- The [GitHub Copilot CLI](https://github.com/github/copilot-cli) (`copilot`), installed and signed in
+- One agent CLI, installed and signed in:
+  - the [GitHub Copilot CLI](https://github.com/github/copilot-cli) (`copilot`), the default;
+  - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`);
+  - or the [OpenAI Codex CLI](https://github.com/openai/codex) (`codex`).
 
 ## Setup
 
@@ -43,13 +46,22 @@ The `:init` line loads the package together with Magit, so `@` works in Magit ri
 
 - `M-x agent-notes-menu` (or `@` in any Magit buffer, or `@` in `magit-dispatch`) offers these commands:
   - `w` review the working tree
+  - `s` review the staged changes
   - `b` review the branch
+  - `c` review a commit or a range
   - `l` open the latest review
   - `o` open any previous review
+  - `a` choose the agent
 - `M-x agent-notes-review` asks for the scope, then the task.
   - **Working tree**: uncommitted changes (staged, unstaged and untracked) compared to `HEAD`.
+  - **Staged**: only what is staged, compared to `HEAD`. Useful just before committing.
   - **Branch**: everything since the current branch forked from a base branch (default `origin/HEAD`, then `main`/`master`). Uncommitted work is included unless `agent-notes-branch-include-uncommitted` is nil.
+  - **Commit or range**: a commit compared to its (first) parent, such as `HEAD` or `a1b2c3d`; or a range, `A..B` (from `A` to `B`) or `A...B` (what `B` added since it forked from `A`). An empty side means `HEAD`, so `HEAD~3..` is the last three commits. In a Magit log, the default is the commit at point; with a region over several commits, it is the range covering all of them.
 - The Magit status buffer shows the latest review ("Agent review: … · 2 open, 1 unsent"). `RET` on that line opens it. Turn it off with `agent-notes-magit-status-section`.
+
+A review of a commit stays on that commit. `g` and saving files don't change it, because it is stored by the commit's id. A range is kept as you typed it, so `g` follows the branches it names, like a branch review does.
+
+In staged, commit and range reviews, the diff is not the working tree. The agent still edits the working tree, and `a` applies suggestions there, so those changes don't appear in the review's diff. The log says which files changed ("not in its diff; see them in Magit"). `RET` opens the working-tree file at the line with the same code, even if it has moved since the commit.
 
 ### Tasks
 
@@ -60,6 +72,20 @@ The task tells the agent what to do with the diff. The built-in tasks are:
 - **Diagram**: a box-and-arrow drawing of the changed parts and how they connect, with a short explanation.
 
 You can also pick "Custom instructions…" or type your own text, for example "explain how the caching works". In Vertico, use `M-RET` to submit text that partially matches a task name. Add your own tasks to `agent-notes-tasks`. Press `A` in a review to give the agent another task; new notes are added to the existing ones, and each task's summary is kept.
+
+### Choosing the agent
+
+Set `agent-notes-agent` to `copilot` (the default), `claude` or `codex`. You can also switch for the current Emacs session with `@` in a review, or `a` in `agent-notes-menu`. The header line shows the agent in use ("Claude Code: idle").
+
+Each review remembers its session with an agent. If you switch agents in the middle of a review, the next request starts a new session with the new agent, and the log says so. The new agent doesn't remember earlier requests. Replies still work well, because each one includes its whole thread and the code around it.
+
+| Agent       | Prompt   | Session                                                               | Permissions                                                                                                                                                       |
+| ----------- | -------- | --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Copilot     | argument | `--session-id <uuid>`                                                 | `--allow-tool` for each of `agent-notes-allowed-tools`, plus `write` when edits are allowed                                                                       |
+| Claude Code | stdin    | `--session-id <uuid>` the first time, then `--resume <uuid>`          | `--allowedTools`, where `shell(git diff)` becomes `Bash(git diff:*)`; `--permission-mode acceptEdits` when edits are allowed, otherwise the edit tools are denied |
+| Codex       | argument | `codex exec`, then `codex exec resume <id>`, with the id Codex prints | `--sandbox workspace-write` when edits are allowed, otherwise `read-only`; the answer is read from `--output-last-message`                                        |
+
+The programs are `agent-notes-copilot-program`, `agent-notes-claude-program` and `agent-notes-codex-program`. Extra arguments, such as the model, go in `agent-notes-copilot-extra-args`, `agent-notes-claude-extra-args` and `agent-notes-codex-extra-args`. To add another CLI, add an entry to `agent-notes-agents` with a function that builds its arguments; its docstring describes the format. Every prompt is the same whichever agent runs it.
 
 ### Keys in the review buffer
 
@@ -83,6 +109,7 @@ Press `?` (or `h`) for a menu with all of these.
 | `a`             | Apply the change suggested in the note at point                                                                     |
 | `s`             | Send all unsent comments to the agent                                                                               |
 | `A`             | Give the agent a task                                                                                               |
+| `@`             | Choose the agent (Copilot, Claude Code, Codex)                                                                      |
 | `g`             | Refresh the diff (same scope and base) and move notes with their code                                               |
 | `RET` / `o`     | Open the file at that line, to read or edit it (on a diagram: open its Graphviz source)                             |
 | `$`             | Show the log: what was sent, how long it took, what came back and what changed                                      |
@@ -133,21 +160,21 @@ When every note is resolved and nothing is unsent, the review says so, and the M
 ## How it works
 
 - **Storage.** Every review is stored in `.git/agent-notes/<id>.json`, with a snapshot of the diff in `<id>.diff`. Nothing is committed. Git never pushes anything inside `.git/`, so reviews stay on your machine: other clones don't see them, and each clone or worktree has its own.
-- **Sessions.** Each review has its own Copilot session (`copilot --session-id <uuid>`), so the agent remembers the review when you reply.
-- **Context.** Every prompt gives the repository, the scope (base commit), the path of the diff snapshot, and the list of changed files with their `+`/`-` counts.
+- **Sessions.** Each review has its own session with the agent (see [Choosing the agent](#choosing-the-agent)), so the agent remembers the review when you reply.
+- **Context.** Every prompt gives the repository, the scope (base and head commits), the path of the diff snapshot, and the list of changed files with their `+`/`-` counts. For staged, commit and range reviews, the agent is also told that the working tree may differ from the diff, and how to read the diff's version of a file (`git show <commit>:<path>`).
   - **Tasks** also include the whole diff, if it is under `agent-notes-inline-diff-limit` characters (40000, about 10k tokens). That way no part of it gets skimmed. Larger diffs are left for the agent to read in parts, and it is told not to skip any file.
   - **Replies** include each thread with new messages, together with the code around it from the hunk: up to `agent-notes-thread-context-lines` lines on each side, with old and new line numbers.
   - **Files.** In both cases the agent can open whole files for more context.
 
   The log (`$`) shows every prompt in full.
 
-- **Permissions.** Copilot runs non-interactively (`copilot -p`) and may:
+- **Permissions.** The agent runs non-interactively and may:
   - read files and run the read-only commands in `agent-notes-allowed-tools`;
-  - edit files (`--allow-tool=write`) when `agent-notes-allow-edits` is non-nil, which is the default. It is told to change code only when you ask.
+  - edit files when `agent-notes-allow-edits` is non-nil, which is the default. It is told to change code only when you ask.
 
-  The agent answers with a JSON block, and only Emacs writes the review files.
+  How these map onto each CLI's flags is in the table above. The agent answers with a JSON block, and only Emacs writes the review files.
 
-- **Change detection.** After each request, Emacs compares the changes with the state before the request. The header shows which files the agent changed. If the diff changed, it is refreshed automatically; set `agent-notes-auto-refresh` to nil to refresh yourself with `g`.
+- **Change detection.** After each request, Emacs compares the uncommitted changes with those before the request, whatever the review's scope. The header shows which files the agent changed. If the review's diff changed, it is refreshed automatically; set `agent-notes-auto-refresh` to nil to refresh yourself with `g`.
 - **Note anchoring.** Each note stores its file, side, line and the code on that line. When the diff is refreshed, a note moves to the nearest line with the same code. If that code is gone, the note is marked "outdated".
 
 ## Customization
@@ -163,7 +190,8 @@ When every note is resolved and nothing is unsent, the review says so, and the M
 - `agent-notes-show-line-numbers`: whether new reviews show line numbers
 - `agent-notes-syntax-highlighting`: highlight code with the file's major mode (mode hooks are not run, so no language server starts). The faces `agent-notes-added-bg` and `agent-notes-removed-bg` set the backgrounds.
 - `agent-notes-refresh-on-save`: refresh reviews when you save a file of the repository
-- `agent-notes-copilot-extra-args`: for example `'("--model" "gpt-5")`
+- `agent-notes-agent`: `copilot`, `claude` or `codex`
+- `agent-notes-copilot-extra-args`, `agent-notes-claude-extra-args`, `agent-notes-codex-extra-args`: for example `'("--model" "gpt-5")` or `'("--model" "opus")`
 - `agent-notes-base-branch`: the default base branch for branch reviews
 - `agent-notes-diagram-format`: `auto` (Graphviz if `dot` is installed), `graphviz` or `text`; `agent-notes-dot-program` is the Graphviz program
 
@@ -171,15 +199,15 @@ When every note is resolved and nothing is unsent, the review says so, and the M
 
 The code is split by concern. Each file requires the ones above it:
 
-| File                    | Contents                                                                               |
-| ----------------------- | -------------------------------------------------------------------------------------- |
-| `agent-notes-core.el`   | Options, faces, the buffer-local state of a review, reading and writing reviews        |
-| `agent-notes-diff.el`   | Git, diff parsing, anchoring and moving notes, syntax highlighting of hunks            |
-| `agent-notes-render.el` | Drawing the review buffer: header, files, hunks, notes, both views                     |
-| `agent-notes-log.el`    | The per-review log and its buffer                                                      |
-| `agent-notes-agent.el`  | Prompts, running Copilot, applying its answers, detecting its edits, suggested changes |
-| `agent-notes-magit.el`  | `@` in Magit and `magit-dispatch`, and the status section; loaded once Magit is loaded |
-| `agent-notes.el`        | The mode, keymap, commands, menus and entry points                                     |
+| File                    | Contents                                                                                                         |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `agent-notes-core.el`   | Options, faces, the agents, the buffer-local state of a review, reading and writing reviews                      |
+| `agent-notes-diff.el`   | Git, the diff of each scope, diff parsing, anchoring and moving notes, syntax highlighting                       |
+| `agent-notes-render.el` | Drawing the review buffer: header, files, hunks, notes, both views                                               |
+| `agent-notes-log.el`    | The per-review log and its buffer                                                                                |
+| `agent-notes-agent.el`  | Prompts, each agent's arguments, running the agent, applying its answers, detecting its edits, suggested changes |
+| `agent-notes-magit.el`  | `@` in Magit and `magit-dispatch`, and the status section; loaded once Magit is loaded                           |
+| `agent-notes.el`        | The mode, keymap, commands, menus and entry points                                                               |
 
 Tests:
 
@@ -191,7 +219,7 @@ emacs -Q --batch \
 
 Use the same Emacs that compiled your packages. On this machine that is `/Applications/Emacs.app/Contents/MacOS/Emacs` (31.1); the `emacs` on `PATH` is 30.2 and prints harmless transient warnings.
 
-- `agent-notes-tests.el` also runs the whole request cycle against a fake `copilot` script, in a scratch git repository. It needs no Copilot requests.
+- `agent-notes-tests.el` also runs the whole request cycle against fake `copilot`, `claude` and `codex` scripts, in a scratch git repository, and checks every diff source. It needs no real agent requests.
 - `integ.el` checks the Magit integration and simulated agent edits, without any Copilot requests.
 - `e2e.el` runs a real Overview task and a code-change request against Copilot. It uses 2 requests.
 

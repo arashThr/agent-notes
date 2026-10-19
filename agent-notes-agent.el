@@ -1,13 +1,13 @@
-;;; agent-notes-agent.el --- Talking to the Copilot CLI for agent-notes -*- lexical-binding: t; -*-
+;;; agent-notes-agent.el --- Talking to the agent CLI for agent-notes -*- lexical-binding: t; -*-
 
 ;; This file is not part of GNU Emacs.
 
 ;;; Commentary:
 
 ;; Part of agent-notes; see agent-notes.el.  This file builds the
-;; prompts, runs the Copilot CLI in the review's session, applies its
-;; JSON answer, notices which files it changed, and applies the code
-;; changes it suggests in notes.
+;; prompts, runs the agent CLI (Copilot, Claude Code or Codex) in the
+;; review's session, applies its JSON answer, notices which files it
+;; changed, and applies the code changes it suggests in notes.
 
 ;;; Code:
 
@@ -49,26 +49,58 @@ To comment on the change as a whole rather than a line, use \"path\": \"\" and \
             "You cannot modify files in this session: when the user asks for a change, "
             "describe it and show the code instead.\n")))
 
+(defun agent-notes--scope-prompt (review)
+  "Return a description of REVIEW's scope for the agent."
+  (let ((base-rev (plist-get review :base_rev))
+        (head (plist-get review :head_rev)))
+    (pcase (plist-get review :scope)
+      ("branch"
+       (format "all changes on the current branch since it diverged from %s (merge-base %s)%s"
+               (plist-get review :base) base-rev
+               (if agent-notes-branch-include-uncommitted
+                   ", including uncommitted and untracked files" "")))
+      ("staged"
+       (format "the staged changes (the index) compared to HEAD (%s); unstaged and untracked \
+changes are not part of the review" base-rev))
+      ("commit"
+       (format "the changes made by commit %s%s, compared to its first parent %s"
+               head (let ((subject (plist-get review :subject)))
+                      (if subject (format " (\"%s\")" subject) ""))
+               base-rev))
+      ("range"
+       (format "the changes of the range %s: from %s to %s" (plist-get review :base) base-rev head))
+      (_ (format "uncommitted changes (staged, unstaged and untracked files) compared to HEAD (%s)"
+                 base-rev)))))
+
+(defun agent-notes--new-side-prompt (review)
+  "Return what the agent must know when REVIEW's diff is not the working tree."
+  (if (agent-notes--shows-working-tree-p review)
+      ""
+    (let ((spec (if (equal (plist-get review :scope) "staged")
+                    ":PATH"
+                  (concat (plist-get review :head_rev) ":PATH"))))
+      (format "The new side of this diff is %s, not the files in the working tree, which may \
+differ from it.  To read a file as it is in the diff, run `git show %s`.  Edits you make go \
+to the working tree, and suggested changes are applied there too, so copy \"original\" \
+from the file in the working tree.\n"
+              (if (equal (plist-get review :scope) "staged")
+                  "the index (the staged version of each file)"
+                (format "commit %s" (plist-get review :head_rev)))
+              spec))))
+
 (defun agent-notes--context-prompt (&optional include-diff)
   "Return the part of the prompt describing the review.
 It lists the changed files.  If INCLUDE-DIFF, it also has the diff
 when it is small enough; see `agent-notes-inline-diff-limit'."
-  (let* ((review agent-notes--review)
-         (base-rev (plist-get review :base_rev)))
+  (let ((review agent-notes--review))
     (concat
      "You are helping the user go through code changes in a git repository, inside their editor. "
      "Your notes are shown inline in the diff, and the user can reply to them.\n"
      "Repository: " (plist-get review :root) "\n"
-     "Scope: "
-     (if (equal (plist-get review :scope) "branch")
-         (format "all changes on the current branch since it diverged from %s (merge-base %s)%s"
-                 (plist-get review :base) base-rev
-                 (if agent-notes-branch-include-uncommitted
-                     ", including uncommitted and untracked files" ""))
-       (format "uncommitted changes (staged, unstaged and untracked files) compared to HEAD (%s)"
-               base-rev))
+     "Scope: " (agent-notes--scope-prompt review)
      ".\nThe exact unified diff under review, which all line numbers refer to, is saved at:\n  "
      (agent-notes--diff-file agent-notes--file) "\n"
+     (agent-notes--new-side-prompt review)
      "The review itself is stored in " (file-name-directory agent-notes--file) ".\n"
      (agent-notes--permissions-prompt)
      "\n" (agent-notes--files-prompt)
@@ -252,8 +284,10 @@ marked with >>.  Return nil if REC is not a line of the diff."
    (if agent-notes-allow-edits
        (concat "When a message asks you to change the code, make the change by editing the "
                "files, then say in your reply which files and lines you changed. Do not change "
-               "anything the user did not ask for. The diff is refreshed after you finish and "
-               "the notes move with the code. ")
+               "anything the user did not ask for. "
+               (if (agent-notes--shows-working-tree-p agent-notes--review)
+                   "The diff is refreshed after you finish and the notes move with the code. "
+                 ""))
      "")
    "When a message asks for a suggestion rather than a change, add \"suggestion\" and "
    "\"original\" to your reply instead, with the same meaning as in a note; the user can "
@@ -462,22 +496,104 @@ Return a description of what changed."
                 "")
               (agent-notes--describe-dropped)))))
 
-;;;; Running Copilot
+;;;; Running the agent
 
-(defun agent-notes--copilot-args (prompt)
-  "Return the Copilot arguments to run PROMPT in the review session."
+(defun agent-notes--copilot-args (request)
+  "Return the Copilot arguments for REQUEST; see `agent-notes-agents'.
+Copilot creates or resumes the session given by --session-id."
   (let ((allowed (if agent-notes-allow-edits
                      (append agent-notes-allowed-tools '("write"))
                    agent-notes-allowed-tools))
         (denied (if agent-notes-allow-edits
                     (remove "write" agent-notes-denied-tools)
                   (cl-adjoin "write" agent-notes-denied-tools :test #'equal))))
-    (append (list "-s" "--session-id" (plist-get agent-notes--review :session)
+    (append (list "-s" "--session-id" (plist-get request :session)
                   (concat "--add-dir=" (file-name-directory agent-notes--file)))
             (mapcar (lambda (tool) (concat "--allow-tool=" tool)) allowed)
             (mapcar (lambda (tool) (concat "--deny-tool=" tool)) denied)
             agent-notes-copilot-extra-args
-            (list "-p" prompt))))
+            (list "-p" (plist-get request :prompt)))))
+
+(defconst agent-notes--claude-edit-tools '("Edit" "Write" "MultiEdit" "NotebookEdit")
+  "The Claude Code tools that change files.")
+
+(defun agent-notes--claude-tool (pattern)
+  "Turn the Copilot permission PATTERN into a Claude Code one, or nil."
+  (cond ((string-match "\\`shell(\\(.*\\))\\'" pattern)
+         (format "Bash(%s:*)" (match-string 1 pattern)))
+        ((equal pattern "shell") "Bash")
+        ((equal pattern "write") nil)
+        (t pattern)))
+
+(defun agent-notes--claude-session-p (session)
+  "Return non-nil if Claude Code has stored the conversation SESSION."
+  (let ((dir (expand-file-name "projects" (or (getenv "CLAUDE_CONFIG_DIR") "~/.claude"))))
+    (and (stringp session) (file-directory-p dir)
+         (file-expand-wildcards (expand-file-name (concat "*/" session ".jsonl") dir)))))
+
+(defun agent-notes--claude-args (request)
+  "Return the Claude Code arguments for REQUEST; see `agent-notes-agents'.
+The prompt goes to standard input.  The first request creates the
+session with --session-id; later ones continue it with --resume."
+  (let* ((session (plist-get request :session))
+         (allowed (delq nil (mapcar #'agent-notes--claude-tool agent-notes-allowed-tools)))
+         (denied (append (delq nil (mapcar #'agent-notes--claude-tool agent-notes-denied-tools))
+                         (unless agent-notes-allow-edits agent-notes--claude-edit-tools))))
+    (append (list "-p" "--output-format" "text")
+            (if (or (plist-get request :resume) (agent-notes--claude-session-p session))
+                (list "--resume" session)
+              (list "--session-id" session))
+            (list "--permission-mode" (if agent-notes-allow-edits "acceptEdits" "default")
+                  "--add-dir" (file-name-directory agent-notes--file))
+            ;; These options take several values, so each list ends at the next option.
+            (and allowed (cons "--allowedTools" allowed))
+            (and denied (cons "--disallowedTools" denied))
+            agent-notes-claude-extra-args)))
+
+(defun agent-notes--codex-args (request)
+  "Return the Codex arguments for REQUEST; see `agent-notes-agents'.
+Codex runs in its sandbox, read-only unless `agent-notes-allow-edits'.
+It chooses the session id, which is found in its output."
+  (append (list "exec" "--skip-git-repo-check"
+                "--sandbox" (if agent-notes-allow-edits "workspace-write" "read-only")
+                "--output-last-message" (plist-get request :output-file))
+          agent-notes-codex-extra-args
+          (and (plist-get request :resume) (list "resume" (plist-get request :session)))
+          (list (plist-get request :prompt))))
+
+(defun agent-notes--use-agent (agent)
+  "Make the session of the current review belong to AGENT.
+When the review used another agent, start a new session and log it."
+  (let* ((name (symbol-name (car agent)))
+         (review agent-notes--review)
+         (owner (or (plist-get review :agent) "copilot")))
+    (unless (equal owner name)
+      (when (or (plist-get review :summaries) (plist-get review :notes)
+                (plist-get review :session_used))
+        (agent-notes--log
+         "You" (format "Switched from %s to %s.  %s starts a new session: it does not \
+remember the earlier requests, but every reply still includes its whole thread."
+                       (agent-notes--agent-name (or (ignore-errors (agent-notes--agent owner))
+                                                    (list (intern owner))))
+                       (agent-notes--agent-name agent) (agent-notes--agent-name agent))))
+      (setq review (plist-put review :agent name))
+      (setq review (plist-put review :session (agent-notes--uuid)))
+      (setq agent-notes--review (plist-put review :session_used nil))
+      (agent-notes--save))))
+
+(defun agent-notes--remember-session (agent output ok)
+  "Remember that the review's session with AGENT can be resumed.
+OUTPUT is what the agent printed; OK is non-nil if it succeeded."
+  (when (equal (plist-get agent-notes--review :agent) (symbol-name (car agent)))
+    (let ((regexp (plist-get (cdr agent) :session-regexp)))
+      (cond ((and regexp (string-match regexp output))
+             (setq agent-notes--review
+                   (plist-put agent-notes--review :session (match-string 1 output)))
+             (setq agent-notes--review (plist-put agent-notes--review :session_used t))
+             (agent-notes--save))
+            ((and ok (not regexp) (not (plist-get agent-notes--review :session_used)))
+             (setq agent-notes--review (plist-put agent-notes--review :session_used t))
+             (agent-notes--save))))))
 
 (defun agent-notes--stop-ticker ()
   "Stop updating the elapsed time."
@@ -486,45 +602,63 @@ Return a description of what changed."
   (setq agent-notes--ticker nil))
 
 (defun agent-notes--run (label prompt on-success &optional in-flight what)
-  "Run Copilot with PROMPT in the review session.
+  "Run the agent of `agent-notes-agent' with PROMPT in the review session.
 LABEL names the request in the header.  WHAT describes it for the
 log.  On success, call ON-SUCCESS with the parsed JSON answer and
 IN-FLIGHT, the ids of the comments sent; it returns a description
 of what changed."
-  (unless (executable-find agent-notes-copilot-program)
-    (user-error "Cannot find `%s'; customize `agent-notes-copilot-program'"
-                agent-notes-copilot-program))
-  (let* ((file agent-notes--file)
-         (default-directory (plist-get agent-notes--review :root))
-         ;; To tell which files the agent changes.
-         (before (ignore-errors
-                   (agent-notes--fingerprints (car (agent-notes--snapshot-diff agent-notes--review)))))
-         (args (agent-notes--copilot-args prompt)))
-    (agent-notes--log
-     "Sent" (concat (or what (format "Asked the agent: %s." label))
-                    "\nCopilot reads the diff and the code it needs, then answers; "
-                    "this often takes a minute or two.")
-     (list "Prompt" prompt)
-     (list "Command" (concat agent-notes-copilot-program " "
-                             (mapconcat #'shell-quote-argument (butlast args 2) " ")
-                             " -p <prompt>")))
-    (setq agent-notes--in-flight in-flight
-          agent-notes--changes nil
-          agent-notes--status (concat label "…")
-          agent-notes--started (float-time)
-          agent-notes--process
-          (make-process
-           :name "agent-notes"
-           :buffer (generate-new-buffer " *agent-notes-output*")
-           :command (cons agent-notes-copilot-program args)
-           :connection-type 'pipe
-           :coding 'utf-8
-           :noquery t
-           :sentinel (lambda (proc _event)
-                       (agent-notes--sentinel proc file label on-success in-flight before))))
-    (agent-notes--stop-ticker)
-    (setq agent-notes--ticker (run-at-time 1 1 #'force-mode-line-update t))
-    (agent-notes--render)))
+  (let* ((agent (agent-notes--agent))
+         (name (agent-notes--agent-name agent))
+         (program (agent-notes--agent-program agent)))
+    (unless (and (stringp program) (executable-find program))
+      (user-error "Cannot find %s (`%s'); see `agent-notes-agent' and `agent-notes-agents'"
+                  name program))
+    (agent-notes--use-agent agent)
+    (let* ((file agent-notes--file)
+           (review agent-notes--review)
+           (default-directory (plist-get review :root))
+           ;; To tell which files the agent changes; a clean tree gives nil.
+           (before (condition-case nil (agent-notes--edit-fingerprints review)
+                     (error :unknown)))
+           (output-file (and (plist-get (cdr agent) :output-file)
+                             (make-temp-file "agent-notes-answer")))
+           (stdin (plist-get (cdr agent) :stdin))
+           (args (funcall (plist-get (cdr agent) :args)
+                          (list :prompt prompt :session (plist-get review :session)
+                                :resume (plist-get review :session_used)
+                                :output-file output-file))))
+      (agent-notes--log
+       "Sent" (concat (or what (format "Asked the agent: %s." label))
+                      (format "\n%s reads the diff and the code it needs, then answers; " name)
+                      "this often takes a minute or two.")
+       (list "Prompt" prompt)
+       (list "Command" (concat program " "
+                               (mapconcat (lambda (arg)
+                                            (if (eq arg prompt) "<prompt>" (shell-quote-argument arg)))
+                                          args " ")
+                               (if stdin " < <prompt>" ""))))
+      (setq agent-notes--in-flight in-flight
+            agent-notes--changes nil
+            agent-notes--status (concat label "…")
+            agent-notes--started (float-time)
+            agent-notes--process
+            (make-process
+             :name "agent-notes"
+             :buffer (generate-new-buffer " *agent-notes-output*")
+             :command (cons program args)
+             :connection-type 'pipe
+             :coding 'utf-8
+             :noquery t
+             :sentinel (lambda (proc _event)
+                         (agent-notes--sentinel proc file label on-success in-flight before
+                                                agent output-file))))
+      ;; Agents that take the prompt as an argument get an empty input.
+      (when stdin
+        (process-send-string agent-notes--process prompt))
+      (process-send-eof agent-notes--process)
+      (agent-notes--stop-ticker)
+      (setq agent-notes--ticker (run-at-time 1 1 #'force-mode-line-update t))
+      (agent-notes--render))))
 
 (defun agent-notes--revert-file-buffers (paths)
   "Revert the unmodified buffers visiting PATHS; return the modified ones."
@@ -541,14 +675,16 @@ of what changed."
 
 (defun agent-notes--detect-changes (before)
   "Find the files changed since BEFORE and refresh the diff if needed.
-BEFORE is the result of `agent-notes--fingerprints' when the agent
-started.  Log what happened and return a short message, or nil."
-  (let* ((snapshot (agent-notes--snapshot-diff agent-notes--review))
+BEFORE is the result of `agent-notes--edit-fingerprints' when the
+agent started, or :unknown.  Log what happened and return a short
+message, or nil."
+  (let* ((review agent-notes--review)
+         (snapshot (agent-notes--snapshot-diff review))
          (diff (car snapshot))
-         (after (agent-notes--fingerprints diff))
+         (after (agent-notes--edit-fingerprints review snapshot))
          (stale (not (equal diff (agent-notes--stored-diff))))
          (changed nil))
-    (when before
+    (unless (eq before :unknown)
       (dolist (entry (append before after))
         (let ((path (car entry)))
           (unless (or (member path changed)
@@ -559,7 +695,8 @@ started.  Log what happened and return a short message, or nil."
       (when conflicts
         (agent-notes--log "Changes" (format "The agent changed %s, which you have unsaved \
 changes to.  Check those buffers before saving." (string-join conflicts ", ")))))
-    (when stale
+    (cond
+     (stale
       (let ((what (if agent-notes--changes
                       (format "the agent changed %s" (string-join agent-notes--changes ", "))
                     "the code changed while the agent worked")))
@@ -570,18 +707,38 @@ changes to.  Check those buffers before saving." (string-join conflicts ", "))))
           (let ((msg (format "%s; diff refreshed, %s" what
                              (agent-notes--describe-moves (agent-notes--resnapshot snapshot)))))
             (agent-notes--log "Changes" (concat (agent-notes--capitalize-first msg) "."))
-            msg))))))
+            msg))))
+     (agent-notes--changes
+      (let ((msg (format "the agent changed %s in the working tree"
+                         (string-join agent-notes--changes ", "))))
+        (agent-notes--log "Changes" (format "%s.  This review shows %s, so these changes \
+are not in its diff; see them in Magit."
+                                            (agent-notes--capitalize-first msg)
+                                            (agent-notes--scope-label review)))
+        msg)))))
 
 (defun agent-notes--last-lines (text n)
   "Return the last N non-empty lines of TEXT."
   (string-join (last (split-string text "\n" t "[ \t\r]+") n) "\n"))
 
-(defun agent-notes--sentinel (proc file label on-success in-flight before)
-  "Handle the end of the Copilot PROC for the review FILE.
+(defun agent-notes--read-answer (output-file)
+  "Return the contents of OUTPUT-FILE and delete it, or nil if it is empty."
+  (when (and output-file (file-exists-p output-file))
+    (prog1 (let ((text (agent-notes--read-file output-file)))
+             (and (not (string-blank-p text)) text))
+      (delete-file output-file))))
+
+(defun agent-notes--sentinel (proc file label on-success in-flight before
+                                   &optional agent output-file)
+  "Handle the end of the agent PROC for the review FILE.
 LABEL, ON-SUCCESS and IN-FLIGHT are as in `agent-notes--run'.
-BEFORE is as in `agent-notes--detect-changes'."
+BEFORE is as in `agent-notes--detect-changes'.  AGENT is the agent
+that ran, and OUTPUT-FILE the file of its answer, if any."
   (when (memq (process-status proc) '(exit signal))
-    (let* ((output (with-current-buffer (process-buffer proc) (buffer-string)))
+    (let* ((agent (or agent (agent-notes--agent)))
+           (name (agent-notes--agent-name agent))
+           (output (with-current-buffer (process-buffer proc) (buffer-string)))
+           (answer (or (agent-notes--read-answer output-file) output))
            (code (process-exit-status proc))
            (aborted (eq (process-status proc) 'signal))
            (ok (and (not aborted) (zerop code)))
@@ -594,16 +751,18 @@ BEFORE is as in `agent-notes--detect-changes'."
                 agent-notes--status nil
                 agent-notes--started nil
                 agent-notes--in-flight nil)
+          (agent-notes--remember-session agent output ok)
           (cond
            (aborted
             (agent-notes--log "Stopped" (format "The request (%s) was aborted after %s." label elapsed)
                               (list "Output so far" output)))
            (ok
-            (agent-notes--log "Done" (format "Copilot answered after %s." elapsed)
-                              (list "Raw answer" output)))
+            (apply #'agent-notes--log "Done" (format "%s answered after %s." name elapsed)
+                   (list "Raw answer" answer)
+                   (unless (eq answer output) (list (list "Output" output)))))
            (t
-            (agent-notes--log "Failed" (format "Copilot exited with code %s after %s:\n%s"
-                                               code elapsed (agent-notes--last-lines output 6))
+            (agent-notes--log "Failed" (format "%s exited with code %s after %s:\n%s"
+                                               name code elapsed (agent-notes--last-lines output 6))
                               (list "Full output" output))))
           ;; Refresh first, so new notes are anchored to the code as it is now.
           (condition-case err
@@ -615,7 +774,7 @@ BEFORE is as in `agent-notes--detect-changes'."
                        (if aborted "aborted" "failed")
                        (if changes (concat "; " changes) ""))
             (condition-case err
-                (let ((result (funcall on-success (agent-notes--extract-json output) in-flight)))
+                (let ((result (funcall on-success (agent-notes--extract-json answer) in-flight)))
                   (agent-notes--save)
                   (agent-notes--log "Applied" (or result "Applied the answer."))
                   (message "Agent Notes: %s done%s" label (if changes (concat "; " changes) "")))

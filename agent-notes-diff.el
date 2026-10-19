@@ -88,14 +88,37 @@
                                   "refs/heads" "refs/remotes")
                 "\n" t))
 
+(defun agent-notes--resolve-rev (rev)
+  "Return the full id of the commit REV, or signal a user error."
+  (or (agent-notes--git-try "rev-parse" "--verify" "--quiet" (concat rev "^{commit}"))
+      (user-error "Unknown commit: %s" rev)))
+
+(defun agent-notes--parse-range (range)
+  "Split RANGE, A..B or A...B, into (A B SYMMETRIC).
+An empty side is HEAD.  SYMMETRIC is non-nil for A...B.  Return nil
+if RANGE is not a range."
+  (when (string-match "\\`\\(.*?\\)\\(\\.\\.\\.?\\)\\(.*\\)\\'" range)
+    (let ((a (string-trim (match-string 1 range)))
+          (b (string-trim (match-string 3 range)))
+          (symmetric (equal (match-string 2 range) "...")))
+      (list (if (string-empty-p a) "HEAD" a) (if (string-empty-p b) "HEAD" b) symmetric))))
+
 (defun agent-notes--make-diff (scope base)
-  "Return (DIFF BASE-LABEL BASE-REV HEAD-REV) for SCOPE and BASE."
+  "Return (DIFF BASE-LABEL BASE-REV HEAD-REV) for SCOPE and BASE.
+SCOPE is \"working\" (uncommitted changes, BASE is ignored),
+\"staged\" (the index vs HEAD), \"branch\" (since the current branch
+forked from the branch BASE), \"commit\" (the commit BASE vs its
+first parent) or \"range\" (BASE is A..B or A...B).  BASE-LABEL is
+what to store as the review's base; for a commit, its full id."
   (let ((head (agent-notes--git-try "rev-parse" "--verify" "--quiet" "HEAD")))
     (pcase scope
       ("working"
        (let ((rev (or head agent-notes--empty-tree)))
          (list (concat (agent-notes--git-diff rev) (agent-notes--untracked-diff))
                "HEAD" rev (or head ""))))
+      ("staged"
+       (let ((rev (or head agent-notes--empty-tree)))
+         (list (agent-notes--git-diff "--cached" rev) "HEAD" rev (or head ""))))
       ("branch"
        (unless head (user-error "The repository has no commits yet"))
        (let ((mb (or (agent-notes--git-try "merge-base" base "HEAD")
@@ -104,12 +127,38 @@
                    (concat (agent-notes--git-diff mb) (agent-notes--untracked-diff))
                  (agent-notes--git-diff mb "HEAD"))
                base mb head)))
+      ("commit"
+       (let* ((commit (agent-notes--resolve-rev base))
+              (parent (or (agent-notes--git-try "rev-parse" "--verify" "--quiet"
+                                                (concat commit "^1"))
+                          agent-notes--empty-tree)))
+         (list (agent-notes--git-diff parent commit) commit parent commit)))
+      ("range"
+       (pcase-let* ((`(,a ,b ,symmetric) (or (agent-notes--parse-range base)
+                                             (user-error "Not a range: %s" base)))
+                    (to (agent-notes--resolve-rev b))
+                    (from (agent-notes--resolve-rev a)))
+         (when symmetric
+           (setq from (or (agent-notes--git-try "merge-base" from to)
+                          (user-error "No common ancestor between %s and %s" a b))))
+         (list (agent-notes--git-diff from to) base from to)))
       (_ (error "Unknown scope %S" scope)))))
 
 (defun agent-notes--snapshot-diff (review)
   "Return (DIFF BASE-LABEL BASE-REV HEAD-REV) for the scope of REVIEW, now."
   (let ((default-directory (plist-get review :root)))
     (agent-notes--make-diff (plist-get review :scope) (plist-get review :base))))
+
+(defun agent-notes--edit-fingerprints (review &optional snapshot)
+  "Return the fingerprints of the uncommitted changes of REVIEW's repository.
+Comparing them before and after a request tells which files the
+agent edited, even when they are not part of the review's diff.
+SNAPSHOT is the review's current diff, reused when it is the same."
+  (agent-notes--fingerprints
+   (if (and snapshot (equal (plist-get review :scope) "working"))
+       (car snapshot)
+     (let ((default-directory (plist-get review :root)))
+       (car (agent-notes--make-diff "working" nil))))))
 
 (defun agent-notes--stored-diff ()
   "Return the diff snapshot of the current review."

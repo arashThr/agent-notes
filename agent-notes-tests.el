@@ -310,14 +310,16 @@ REVIEW-EXTRA is a plist merged into the stored review."
         (should (string-search "Explain the tests only." prompt))
         (should-not (string-search "meticulous" prompt))))
     (let ((agent-notes-allow-edits t))
-      (should (member "--allow-tool=write" (agent-notes--copilot-args "x")))
-      (should-not (member "--deny-tool=write" (agent-notes--copilot-args "x")))
+      (should (member "--allow-tool=write" (agent-notes--copilot-args '(:prompt "x"))))
+      (should-not (member "--deny-tool=write" (agent-notes--copilot-args '(:prompt "x"))))
       (should (string-search "edit files" (agent-notes--reply-prompt nil nil))))
     (let ((agent-notes-allow-edits nil))
-      (should (member "--deny-tool=write" (agent-notes--copilot-args "x")))
-      (should-not (member "--allow-tool=write" (agent-notes--copilot-args "x")))
+      (should (member "--deny-tool=write" (agent-notes--copilot-args '(:prompt "x"))))
+      (should-not (member "--allow-tool=write" (agent-notes--copilot-args '(:prompt "x"))))
       (should (string-search "cannot modify files" (agent-notes--reply-prompt nil nil))))
-    (should (equal (last (agent-notes--copilot-args "the prompt") 2) '("-p" "the prompt")))
+    (let ((args (agent-notes--copilot-args '(:prompt "the prompt" :session "s1"))))
+      (should (equal (last args 2) '("-p" "the prompt")))
+      (should (equal (cadr (member "--session-id" args)) "s1")))
     (let ((agent-notes-diagram-format 'graphviz))
       (should (string-search "```dot" (agent-notes--task-prompt '("Mine" . "x"))))
       (should (string-search "```dot" (agent-notes--reply-prompt nil nil))))
@@ -713,6 +715,199 @@ It runs SHELL, prints ANSWER and ignores its arguments."
         (should (equal (plist-get last :stage) "Failed"))
         (should (string-search "code 3" (plist-get last :text)))
         (should (string-search "not signed in" (plist-get last :text)))))))
+
+;;;; Diff sources
+
+(ert-deftest agent-notes-test-ranges-and-labels ()
+  (should (equal (agent-notes--parse-range "main..feature") '("main" "feature" nil)))
+  (should (equal (agent-notes--parse-range "main...feature") '("main" "feature" t)))
+  (should (equal (agent-notes--parse-range "HEAD~3..") '("HEAD~3" "HEAD" nil)))
+  (should (equal (agent-notes--parse-range "abc^..def") '("abc^" "def" nil)))
+  (should-not (agent-notes--parse-range "HEAD~2"))
+  (should (equal (agent-notes--commit-scope "a..b") '("range" "a..b")))
+  (should (equal (agent-notes--commit-scope "HEAD") '("commit" "HEAD")))
+  (should (equal (agent-notes--scope-label
+                  (list :scope "commit" :base (make-string 40 ?a) :subject "Fix it"))
+                 "Commit aaaaaaa Fix it"))
+  (should (equal (agent-notes--scope-label '(:scope "range" :base "a..b")) "Range a..b"))
+  (should (equal (agent-notes--scope-label '(:scope "staged")) "Staged vs HEAD"))
+  (should (equal (agent-notes--scope-label '(:scope "working")) "Working tree vs HEAD")))
+
+(ert-deftest agent-notes-test-diff-sources ()
+  (agent-notes-tests--with-repo
+    (cl-flet ((diff (scope &optional base) (car (agent-notes--make-diff scope base))))
+      ;; Staged: only what is in the index.
+      (should (string-empty-p (diff "staged")))
+      (agent-notes--git "add" "src/auth.py")
+      (should (string-search "+    if user.disabled:" (diff "staged")))
+      (agent-notes--git "-c" "commit.gpgsign=false" "commit" "-q" "--no-verify"
+                        "-m" "Check disabled users")
+      (should (string-empty-p (diff "staged")))
+      (let ((head (agent-notes--git-try "rev-parse" "HEAD"))
+            (parent (agent-notes--git-try "rev-parse" "HEAD~1")))
+        ;; A commit is stored by its id, so the review keeps showing it.
+        (pcase-let ((`(,d ,label ,base-rev ,head-rev) (agent-notes--make-diff "commit" "HEAD")))
+          (should (string-search "+    if user.disabled:" d))
+          (should (equal (list label base-rev head-rev) (list head parent head))))
+        ;; The first commit is compared with the empty tree.
+        (should (string-search "new file mode" (diff "commit" "HEAD~1")))
+        (should (equal (nth 2 (agent-notes--make-diff "commit" "HEAD~1")) agent-notes--empty-tree))
+        ;; Ranges, kept as typed.
+        (should (equal (diff "range" "HEAD~1..HEAD") (diff "commit" "HEAD")))
+        (should (equal (diff "range" "HEAD~1...HEAD") (diff "commit" "HEAD")))
+        (should (equal (cadr (agent-notes--make-diff "range" "HEAD~1..")) "HEAD~1.."))
+        (should-error (diff "commit" "no-such-rev") :type 'user-error)
+        ;; A review of the commit.
+        (let ((buf (agent-notes--create-review "commit" "HEAD")))
+          (unwind-protect
+              (with-current-buffer buf
+                (should (equal (agent-notes--scope-label agent-notes--review)
+                               (concat "Commit " (substring head 0 7) " Check disabled users")))
+                (let ((prompt (agent-notes--task-prompt '("Mine" . "x"))))
+                  (should (string-search (format "the changes made by commit %s" head) prompt))
+                  (should (string-search (format "git show %s:PATH" head) prompt)))
+                ;; The agent's edits are noticed, although they are not in the diff.
+                (let ((before (agent-notes--edit-fingerprints agent-notes--review)))
+                  (agent-notes--write-file "src/auth.py"
+                                           (concat "# a\n# b\n" agent-notes-tests--auth-new))
+                  (should (string-search "in the working tree" (agent-notes--detect-changes before)))
+                  (should (equal agent-notes--changes '("src/auth.py")))
+                  (should (string-search "not in its diff"
+                                         (plist-get (car (last agent-notes--log-entries)) :text)))
+                  (should-not (string-search "# a" (agent-notes--stored-diff))))
+                ;; Visiting finds the line, two lines lower now.
+                (goto-char (agent-notes--find-prop
+                            'agent-notes-loc
+                            (agent-notes--exact-record '(:path "src/auth.py" :side "new" :line 11))))
+                (agent-notes-visit)
+                (should (= (line-number-at-pos) 13))
+                (should (looking-at "    if user.disabled:")))
+            (kill-buffer buf)))))))
+
+;;;; Other agents
+
+(ert-deftest agent-notes-test-agent-args ()
+  (agent-notes-tests--with-review nil
+    (cl-letf (((symbol-function 'agent-notes--claude-session-p) #'ignore))
+      (let* ((agent-notes-allow-edits t)
+             (agent-notes-allowed-tools '("shell(git diff)" "shell" "WebFetch"))
+             (agent-notes-denied-tools nil)
+             (args (agent-notes--claude-args '(:prompt "p" :session "s1"))))
+        (should (equal (cadr (member "--session-id" args)) "s1"))
+        (should-not (member "--resume" args))
+        (should-not (member "p" args))
+        (should (equal (cadr (member "--permission-mode" args)) "acceptEdits"))
+        (should (equal (cdr (member "--allowedTools" args))
+                       '("Bash(git diff:*)" "Bash" "WebFetch")))
+        (should-not (member "--disallowedTools" args)))
+      (let* ((agent-notes-allow-edits nil)
+             (args (agent-notes--claude-args '(:prompt "p" :session "s1" :resume t))))
+        (should (equal (cadr (member "--resume" args)) "s1"))
+        (should-not (member "--session-id" args))
+        (should (member "Edit" (member "--disallowedTools" args)))
+        (should (equal (cadr (member "--permission-mode" args)) "default"))))
+    ;; A session Claude Code has stored is resumed.
+    (let* ((config (make-temp-file "agent-notes-claude" t))
+           (process-environment (cons (concat "CLAUDE_CONFIG_DIR=" config) process-environment)))
+      (unwind-protect
+          (progn
+            (should-not (agent-notes--claude-session-p "s2"))
+            (make-directory (expand-file-name "projects/-tmp-repo" config) t)
+            (agent-notes--write-file (expand-file-name "projects/-tmp-repo/s2.jsonl" config) "{}")
+            (should (agent-notes--claude-session-p "s2"))
+            (should (member "--resume" (agent-notes--claude-args '(:prompt "p" :session "s2")))))
+        (delete-directory config t)))
+    (let* ((agent-notes-allow-edits nil)
+           (args (agent-notes--codex-args '(:prompt "p" :session "s1" :output-file "/tmp/o"))))
+      (should (equal (car args) "exec"))
+      (should (equal (cadr (member "--sandbox" args)) "read-only"))
+      (should (equal (cadr (member "--output-last-message" args)) "/tmp/o"))
+      (should-not (member "resume" args))
+      (should (equal (car (last args)) "p")))
+    (let* ((agent-notes-allow-edits t)
+           (args (agent-notes--codex-args
+                  '(:prompt "p" :session "s1" :resume t :output-file "/tmp/o"))))
+      (should (equal (cadr (member "--sandbox" args)) "workspace-write"))
+      (should (equal (last args 3) '("resume" "s1" "p"))))
+    (let ((agent-notes-agent 'claude))
+      (should (equal (agent-notes--agent-name) "Claude Code"))
+      (should (string-search "Claude Code" (agent-notes--choose-agent-description)))
+      (should (string-search "Claude Code: idle" (agent-notes--header-line))))
+    (let ((agent-notes-agent 'nope))
+      (should (equal (agent-notes--agent-name) "nope"))
+      (should-error (agent-notes--agent) :type 'user-error))))
+
+(defun agent-notes-tests--script (dir name body)
+  "Write the shell script NAME with BODY to DIR and return its file name."
+  (let ((file (expand-file-name name dir)))
+    (agent-notes--write-file file (concat "#!/bin/sh\n" body))
+    (set-file-modes file #o755)
+    file))
+
+(ert-deftest agent-notes-test-claude-and-codex-runs ()
+  (agent-notes-tests--with-repo
+    (cl-letf (((symbol-function 'agent-notes--claude-session-p) #'ignore))
+      ;; Claude Code reads the prompt on stdin; the session is created, then resumed.
+      (let ((agent-notes-agent 'claude)
+            (agent-notes-claude-program
+             (agent-notes-tests--script
+              tmp "fake-claude"
+              (concat "echo \"$@\" >> " tmp "claude-args\n"
+                      "cat > " tmp "claude-stdin\n"
+                      "cat <<'EOF'\n```json\n{\"summary\": \"From Claude.\", \"notes\": []}\n```\nEOF\n"))))
+        (agent-notes--start-task '("Mine" . "Explain the tests."))
+        (agent-notes-tests--wait)
+        (let ((session (plist-get agent-notes--review :session)))
+          (should (equal (plist-get agent-notes--review :agent) "claude"))
+          (should (plist-get agent-notes--review :session_used))
+          (should (string-search "Explain the tests."
+                                 (agent-notes--read-file (concat tmp "claude-stdin"))))
+          (should (string-search (concat "--session-id " session)
+                                 (agent-notes--read-file (concat tmp "claude-args"))))
+          (should (equal (plist-get (car (last (plist-get agent-notes--review :summaries))) :text)
+                         "From Claude."))
+          (should (cl-some (lambda (e) (string-search "Claude Code answered after"
+                                                      (plist-get e :text)))
+                           agent-notes--log-entries))
+          ;; Nothing had happened in the review, so there was no switch to log.
+          (should-not (cl-some (lambda (e) (string-search "Switched" (plist-get e :text)))
+                               agent-notes--log-entries))
+          (agent-notes--start-task '("Mine" . "Again."))
+          (agent-notes-tests--wait)
+          (should (string-search (concat "--resume " session)
+                                 (cadr (split-string (agent-notes--read-file (concat tmp "claude-args"))
+                                                     "\n"))))))
+      ;; Codex: the answer comes from its output file, the session id from its output.
+      (let ((agent-notes-agent 'codex)
+            (agent-notes-codex-program
+             (agent-notes-tests--script
+              tmp "fake-codex"
+              (concat "echo \"$@\" >> " tmp "codex-args\n"
+                      "out=''; prev=''\n"
+                      "for a in \"$@\"; do\n"
+                      "  if [ \"$prev\" = --output-last-message ]; then out=\"$a\"; fi\n"
+                      "  prev=\"$a\"\n"
+                      "done\n"
+                      "echo 'session id: 0199abcd-1234' >&2\n"
+                      "printf '```json\\n{\"summary\": \"WRONG\", \"notes\": []}\\n```\\n'\n"
+                      "cat > \"$out\" <<'EOF'\nDone.\n```json\n"
+                      "{\"summary\": \"From Codex.\", \"notes\": []}\n```\nEOF\n"))))
+        (agent-notes--start-task '("Mine" . "Explain."))
+        (agent-notes-tests--wait)
+        (should (cl-some (lambda (e) (string-search "Switched from Claude Code to Codex"
+                                                    (plist-get e :text)))
+                         agent-notes--log-entries))
+        (should (equal (plist-get (car (last (plist-get agent-notes--review :summaries))) :text)
+                       "From Codex."))
+        (should (equal (plist-get agent-notes--review :session) "0199abcd-1234"))
+        (should (plist-get agent-notes--review :session_used))
+        (should-not (string-search "resume" (agent-notes--read-file (concat tmp "codex-args"))))
+        (agent-notes--start-task '("Mine" . "Again."))
+        (agent-notes-tests--wait)
+        (should (string-search "resume 0199abcd-1234 "
+                               (agent-notes--read-file (concat tmp "codex-args"))))
+        ;; The session survives reopening the review.
+        (should (string-search "\"agent\": \"codex\"" (agent-notes--read-file agent-notes--file)))))))
 
 (provide 'agent-notes-tests)
 ;;; agent-notes-tests.el ends here

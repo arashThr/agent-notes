@@ -22,6 +22,17 @@
   :group 'tools
   :prefix "agent-notes-")
 
+(defcustom agent-notes-agent 'copilot
+  "The agent CLI that does the work: a key of `agent-notes-agents'.
+Each review remembers its session with an agent.  If you switch
+agents during a review, the next request starts a new session: the
+new agent does not remember earlier requests, but every reply still
+includes its whole thread and the code around it."
+  :type '(choice (const :tag "GitHub Copilot CLI" copilot)
+                 (const :tag "Claude Code" claude)
+                 (const :tag "OpenAI Codex CLI" codex)
+                 (symbol :tag "Other agent in `agent-notes-agents'")))
+
 (defcustom agent-notes-copilot-program "copilot"
   "Name or path of the GitHub Copilot CLI executable."
   :type 'string)
@@ -29,6 +40,24 @@
 (defcustom agent-notes-copilot-extra-args nil
   "Extra arguments passed to every Copilot invocation.
 For example \\='(\"--model\" \"gpt-5\")."
+  :type '(repeat string))
+
+(defcustom agent-notes-claude-program "claude"
+  "Name or path of the Claude Code executable."
+  :type 'string)
+
+(defcustom agent-notes-claude-extra-args nil
+  "Extra arguments passed to every Claude Code invocation.
+For example \\='(\"--model\" \"opus\")."
+  :type '(repeat string))
+
+(defcustom agent-notes-codex-program "codex"
+  "Name or path of the OpenAI Codex CLI executable."
+  :type 'string)
+
+(defcustom agent-notes-codex-extra-args nil
+  "Extra arguments passed to every Codex invocation, after `codex exec'.
+For example \\='(\"--model\" \"gpt-5-codex\")."
   :type '(repeat string))
 
 (defcustom agent-notes-allow-edits t
@@ -44,15 +73,17 @@ the agent describes changes instead of making them."
     "shell(git status)" "shell(git grep)" "shell(git ls-files)"
     "shell(rg)" "shell(grep)" "shell(ls)" "shell(cat)" "shell(head)"
     "shell(tail)" "shell(wc)")
-  "Copilot permission patterns the agent may use without asking.
-Each entry is passed as --allow-tool.  File writes are controlled
-separately by `agent-notes-allow-edits'."
+  "Commands the agent may run without asking, as Copilot patterns.
+Copilot gets each entry as --allow-tool; Claude Code gets
+shell(CMD) as Bash(CMD:*) and other entries as they are.  Codex
+runs in a sandbox instead and ignores them.  File writes are
+controlled separately by `agent-notes-allow-edits'."
   :type '(repeat string))
 
 (defcustom agent-notes-denied-tools nil
-  "Copilot permission patterns the agent is never allowed to use.
-Each entry is passed as --deny-tool.  \"write\" is added or removed
-according to `agent-notes-allow-edits'."
+  "Commands the agent is never allowed to use, as Copilot patterns.
+They are translated like `agent-notes-allowed-tools'.  Writing
+files is denied or allowed according to `agent-notes-allow-edits'."
   :type '(repeat string))
 
 (defcustom agent-notes-auto-refresh t
@@ -245,7 +276,7 @@ Only set a background here, so the colors of the code stay visible.")
 (defvar-local agent-notes--records nil "Parsed diff line records.")
 (defvar-local agent-notes--index nil "Map from location key to diff record.")
 (defvar-local agent-notes--placement nil "Map from note id to the record it is shown under.")
-(defvar-local agent-notes--process nil "Running Copilot process, if any.")
+(defvar-local agent-notes--process nil "Running agent process, if any.")
 (defvar-local agent-notes--status nil "What the agent is doing, or nil when idle.")
 (defvar-local agent-notes--started nil "When the running request started, as a float time.")
 (defvar-local agent-notes--in-flight nil "Ids of comments currently being sent.")
@@ -410,11 +441,80 @@ Only set a background here, so the colors of the code stay visible.")
    (car (split-string (plist-get (car (plist-get note :comments)) :body) "\n"))
    width nil nil "…"))
 
+(defun agent-notes--short-rev (rev)
+  "Return REV abbreviated if it is a full commit id."
+  (if (and (stringp rev) (string-match-p "\\`[0-9a-f]\\{40,\\}\\'" rev))
+      (substring rev 0 7)
+    rev))
+
 (defun agent-notes--scope-label (review)
   "Return a short description of REVIEW's scope."
-  (if (equal (plist-get review :scope) "branch")
-      (format "Branch vs %s" (plist-get review :base))
-    "Working tree vs HEAD"))
+  (pcase (plist-get review :scope)
+    ("branch" (format "Branch vs %s" (plist-get review :base)))
+    ("staged" "Staged vs HEAD")
+    ("commit" (let ((subject (plist-get review :subject)))
+                (concat "Commit " (agent-notes--short-rev (plist-get review :base))
+                        (if (and subject (not (string-empty-p subject)))
+                            (concat " " (truncate-string-to-width subject 40 nil nil "…"))
+                          ""))))
+    ("range" (format "Range %s" (plist-get review :base)))
+    (_ "Working tree vs HEAD")))
+
+(defun agent-notes--shows-working-tree-p (review)
+  "Return non-nil if the new side of REVIEW's diff is the working tree."
+  (pcase (plist-get review :scope)
+    ("working" t)
+    ("branch" agent-notes-branch-include-uncommitted)
+    (_ nil)))
+
+;;;; Agents
+
+(defvar agent-notes-agents
+  '((copilot :name "Copilot" :program agent-notes-copilot-program
+             :args agent-notes--copilot-args)
+    (claude :name "Claude Code" :program agent-notes-claude-program
+            :args agent-notes--claude-args :stdin t)
+    (codex :name "Codex" :program agent-notes-codex-program
+           :args agent-notes--codex-args :output-file t
+           :session-regexp "^session id: \\([-0-9a-zA-Z]+\\)"))
+  "The agent CLIs that agent-notes can run, as (SYMBOL . PROPERTIES).
+Choose one with `agent-notes-agent'.  PROPERTIES is a plist:
+
+:name            the name shown in the review and the log.
+:program         the executable: a string, or a variable holding it.
+:args            a function called in the review buffer with a request
+                 and returning the arguments of the program.  The
+                 request is a plist with :prompt, :session (the session
+                 id), :resume (non-nil once the session has been used)
+                 and :output-file.
+:stdin           if non-nil, the prompt is sent on standard input, not
+                 in the arguments.
+:output-file     if non-nil, :output-file is a temporary file where the
+                 program writes its final answer; otherwise the answer
+                 is read from what the program prints.
+:session-regexp  if non-nil, the program chooses the session id itself
+                 and prints it, and group 1 of this regexp finds it.
+                 Otherwise agent-notes makes up a UUID for the session.")
+
+(defun agent-notes--agent (&optional name)
+  "Return (SYMBOL . PROPERTIES) of the agent NAME, a symbol or string.
+NAME defaults to `agent-notes-agent'."
+  (let ((name (or name agent-notes-agent)))
+    (or (assq (if (stringp name) (intern name) name) agent-notes-agents)
+        (user-error "Unknown agent %s; see `agent-notes-agents'" name))))
+
+(defun agent-notes--agent-name (&optional agent)
+  "Return the display name of AGENT, or of `agent-notes-agent'.
+Never signal an error, so it can be used in mode lines."
+  (let ((agent (or agent (ignore-errors (agent-notes--agent)))))
+    (if agent
+        (or (plist-get (cdr agent) :name) (symbol-name (car agent)))
+      (format "%s" agent-notes-agent))))
+
+(defun agent-notes--agent-program (agent)
+  "Return the executable of AGENT."
+  (let ((program (plist-get (cdr agent) :program)))
+    (if (and program (symbolp program)) (symbol-value program) program)))
 
 (defun agent-notes--repo-name (review)
   "Return the name of REVIEW's repository."
