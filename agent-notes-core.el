@@ -107,18 +107,16 @@ only on the most important parts; skip boilerplate, formatting, renames and \
 other mechanical edits.  In the summary, explain what changed and why, in \
 the order the user should read it (a short paragraph or a few bullet \
 points).  When the change involves several interacting parts, start the \
-summary with a small diagram of them: a plain-text box-and-arrow drawing in \
-a ```text fenced block, at most 78 columns wide.  Then leave about 3 to 8 \
+summary with a small diagram of them.  Then leave about 3 to 8 \
 notes with severity \"info\" on the key lines, each explaining what that \
 part does and how it fits into the whole.  Do not hunt for bugs, but \
 mention anything that is clearly broken.")
     ("Diagram" . "Draw a diagram that explains the structure of these \
 changes: the components, functions or data involved, how control or data \
-flows between them, and which parts are new or changed.  Draw it as plain \
-text with Unicode box-drawing characters and arrows, inside a ```text \
-fenced block in the summary, at most 78 columns wide.  After the diagram, \
-explain it in two to four sentences.  Leave only a few \"info\" notes, on \
-the lines where the main boxes of the diagram are implemented."))
+flows between them, and which parts are new or changed.  Put it in the \
+summary, and after it explain the diagram in two to four sentences.  \
+Leave only a few \"info\" notes, on the lines where the main parts of \
+the diagram are implemented."))
   "Tasks you can give the agent, as an alist of (NAME . INSTRUCTIONS).
 When starting a review or pressing \\<agent-notes-mode-map>\\[agent-notes-request-review], you choose a task by
 NAME, or type your own instructions instead.  The agent always
@@ -138,6 +136,19 @@ For example, the conventions of your project."
 (defcustom agent-notes-magit-status-section t
   "When non-nil, show the latest review in the Magit status buffer."
   :type 'boolean)
+
+(defcustom agent-notes-diagram-format 'auto
+  "How the agent draws diagrams.
+`graphviz': in Graphviz DOT, shown as images (needs the `dot'
+program and an Emacs that displays SVG); `text': with box-drawing
+characters; `auto': `graphviz' if `dot' is installed, else `text'."
+  :type '(choice (const :tag "Graphviz if installed" auto)
+                 (const :tag "Graphviz" graphviz)
+                 (const :tag "Plain text" text)))
+
+(defcustom agent-notes-dot-program "dot"
+  "The Graphviz program that renders diagrams."
+  :type 'string)
 
 (defcustom agent-notes-directory-name "agent-notes"
   "Name of the directory inside the git directory that stores reviews."

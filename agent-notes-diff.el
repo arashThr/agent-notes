@@ -328,6 +328,40 @@ Return nil if the file does not have those lines."
             (when (zerop (forward-line (1- count)))
               (buffer-substring-no-properties beg (line-end-position)))))))))
 
+(defun agent-notes--split-lines (text)
+  "Return the lines of TEXT, ignoring one final newline."
+  (split-string (string-remove-suffix "\n" text) "\n"))
+
+(defun agent-notes--read-lines (path)
+  "Return the lines of PATH in the working tree, or nil if unreadable."
+  (let ((file (expand-file-name path (plist-get agent-notes--review :root))))
+    (when (and (file-readable-p file) (not (file-directory-p file)))
+      (with-temp-buffer
+        (let ((coding-system-for-read 'utf-8))
+          (insert-file-contents file))
+        (agent-notes--split-lines (buffer-string))))))
+
+(defun agent-notes--same-line-p (a b)
+  "Return non-nil if lines A and B are equal but for trailing whitespace."
+  (and a b (equal (string-trim-right a) (string-trim-right b))))
+
+(defun agent-notes--locate-lines (lines target near)
+  "Return the line number where the lines TARGET appear in LINES.
+LINES and TARGET are lists of strings; trailing whitespace is
+ignored.  When TARGET appears several times, return the occurrence
+that starts nearest to line NEAR.  Return nil if it is absent."
+  (let* ((lines (vconcat (mapcar #'string-trim-right lines)))
+         (target (vconcat (mapcar #'string-trim-right target)))
+         (n (length target))
+         (best nil))
+    (when (> n 0)
+      (dotimes (i (max 0 (1+ (- (length lines) n))))
+        (when (cl-loop for j below n
+                       always (equal (aref lines (+ i j)) (aref target j)))
+          (when (or (null best) (< (abs (- (1+ i) near)) (abs (- best near))))
+            (setq best (1+ i))))))
+    best))
+
 ;;;; Following the code when the diff changes
 
 (defun agent-notes--reanchor (note)

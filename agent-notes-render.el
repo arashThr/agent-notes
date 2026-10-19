@@ -11,6 +11,7 @@
 ;;; Code:
 
 (require 'eieio)
+(require 'color)
 (require 'text-property-search)
 (require 'diff-mode)
 (require 'magit-section)
@@ -115,15 +116,122 @@ background."
   "Insert TEXT, prefixed with PAD on each line, with Markdown faces.
 BASE and PLAIN are as in `agent-notes--fontify-line'.  When
 FENCE-WIDTH is non-nil, lines in code blocks are cut at that width
-instead of wrapping, which keeps diagrams intact."
-  (let ((in-fence nil))
+instead of wrapping, which keeps diagrams intact.  Graphviz code
+blocks are shown as images when possible."
+  (let ((in-fence nil)
+        (diagram nil))                  ; (OPENING-FENCE . REVERSED-LINES)
     (dolist (line (split-string text "\n"))
       (let ((fence (agent-notes--fence-p line)))
-        (when (and in-fence (not fence) fence-width
-                   (> (string-width line) fence-width))
-          (setq line (truncate-string-to-width line fence-width nil nil "…")))
-        (insert pad (agent-notes--fontify-line line in-fence base plain) "\n")
-        (when fence (setq in-fence (not in-fence)))))))
+        (cond
+         (diagram
+          (if (not fence)
+              (push line (cdr diagram))
+            (agent-notes--insert-diagram (car diagram) (reverse (cdr diagram))
+                                         base pad plain fence-width)
+            (setq diagram nil)))
+         ((and fence (not in-fence) (agent-notes--dot-fence-p line))
+          (setq diagram (list line)))
+         (t
+          (insert pad (agent-notes--fontify-line
+                       (agent-notes--fit-code-line line (and in-fence (not fence)) fence-width)
+                       in-fence base plain)
+                  "\n")
+          (when fence (setq in-fence (not in-fence)))))))
+    (when diagram
+      (agent-notes--insert-diagram (car diagram) (reverse (cdr diagram))
+                                   base pad plain fence-width))))
+
+(defun agent-notes--fit-code-line (line in-code width)
+  "Return LINE, cut at WIDTH if IN-CODE and WIDTH is non-nil."
+  (if (and in-code width (> (string-width line) width))
+      (truncate-string-to-width line width nil nil "…")
+    line))
+
+;;;; Diagrams
+
+(defvar agent-notes--diagram-cache (make-hash-table :test #'equal)
+  "Rendered diagrams: md5 of the color and source, to SVG or `failed'.")
+
+(defun agent-notes--dot-fence-p (line)
+  "Return non-nil if LINE opens a Graphviz code block."
+  (string-match-p "\\`[ \t]*```[ \t]*\\(?:dot\\|graphviz\\|gv\\)[ \t]*\\'" line))
+
+(defun agent-notes--diagram-images-p ()
+  "Return non-nil if Graphviz diagrams can be shown as images."
+  (and (display-images-p)
+       (image-type-available-p 'svg)
+       (executable-find agent-notes-dot-program)
+       t))
+
+(defun agent-notes--diagram-color ()
+  "Return the color of the text, as #RRGGBB, for drawing diagrams."
+  (or (ignore-errors
+        (apply #'color-rgb-to-hex
+               (append (color-name-to-rgb (face-foreground 'default nil t)) '(2))))
+      "black"))
+
+(defun agent-notes--render-dot (source)
+  "Return the Graphviz SOURCE rendered as SVG, or nil if that fails.
+The diagram is drawn in the color of the text, on a transparent
+background."
+  (let* ((fg (agent-notes--diagram-color))
+         (key (md5 (concat fg "\n" source)))
+         (svg (gethash key agent-notes--diagram-cache)))
+    (unless svg
+      (setq svg (with-temp-buffer
+                  (insert source)
+                  (let* ((coding-system-for-read 'utf-8)
+                         (coding-system-for-write 'utf-8)
+                         (status
+                          (ignore-errors
+                            (apply #'call-process-region (point-min) (point-max)
+                                   agent-notes-dot-program t '(t nil) nil
+                                   "-Tsvg" "-Gbgcolor=transparent"
+                                   (mapcar (lambda (option) (concat option fg))
+                                           '("-Gcolor=" "-Ncolor=" "-Ecolor=" "-Gfontcolor="
+                                             "-Nfontcolor=" "-Efontcolor="))))))
+                    (goto-char (point-min))
+                    (if (and (eql status 0) (search-forward "<svg" nil t))
+                        (buffer-string)
+                      'failed))))
+      (puthash key svg agent-notes--diagram-cache))
+    (and (stringp svg) svg)))
+
+(defun agent-notes--insert-diagram (open lines base pad plain fence-width)
+  "Insert the Graphviz code block opened by the line OPEN, with LINES.
+Show it as an image when possible, or else as code.  BASE, PAD,
+PLAIN and FENCE-WIDTH are as in `agent-notes--insert-markdown'."
+  (let* ((source (string-join lines "\n"))
+         (images (agent-notes--diagram-images-p))
+         (svg (and images (agent-notes--render-dot source)))
+         (start (point)))
+    (if svg
+        (insert pad
+                (propertize " " 'display
+                            (create-image svg 'svg t
+                                          :ascent 'center
+                                          :max-width
+                                          (* (max 20 (- (or agent-notes--width 80)
+                                                        (string-width pad)))
+                                             (frame-char-width))))
+                "\n")
+      (insert pad (agent-notes--fontify-line open nil base plain) "\n")
+      (dolist (line lines)
+        (insert pad (agent-notes--fontify-line
+                     (agent-notes--fit-code-line line t fence-width) t base plain)
+                "\n"))
+      (insert pad (agent-notes--fontify-line "```" nil base plain) "\n"
+              pad (propertize
+                   (substitute-command-keys
+                    (cond ((not (executable-find agent-notes-dot-program))
+                           "(Install Graphviz to see this diagram as an image.)")
+                          ((not images)
+                           "(\\<agent-notes-mode-map>\\[agent-notes-visit] opens this diagram.)")
+                          (t "(Graphviz could not render this diagram; \
+\\<agent-notes-mode-map>\\[agent-notes-visit] opens its source.)")))
+                   'font-lock-face (if plain 'shadow '(shadow agent-notes-note)))
+              "\n"))
+    (put-text-property start (point) 'agent-notes-diagram source)))
 
 ;;;; Notes
 

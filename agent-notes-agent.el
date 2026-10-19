@@ -30,8 +30,8 @@
 - \"line\": the line number, as an integer.
 - \"severity\": one of \"issue\", \"warning\", \"suggestion\", \"question\", \"nit\", or \"info\" for explanations that are not problems.
 - \"body\": the note in Markdown. Be specific and concise.
-- \"suggestion\" (optional, only for \"side\": \"new\"): when you know the exact fix, the complete replacement for lines \"line\" through \"end_line\" of the new version of the file, as one string with \\n between lines and the original indentation. The user can apply it with one key, so it must be correct, complete code. Leave it out when unsure or when the fix spans several places.
-- \"end_line\" (optional): the last line replaced by \"suggestion\"; defaults to \"line\".
+- \"suggestion\" (optional, only for \"side\": \"new\"): when you know the exact fix, the replacement code, as one string with \\n between lines and the original indentation. Leave it out when unsure or when the fix spans several places.
+- \"original\" (required with \"suggestion\"): the exact lines of the current file that \"suggestion\" replaces, copied verbatim as whole lines with their indentation, as one string. The editor finds this text near \"line\" and replaces it with \"suggestion\", like search and replace, when the user presses one key. Both must cover the same whole lines: if \"suggestion\" repeats a line for context (for example the function's signature), \"original\" must include that line too, or it ends up twice in the file. After the replacement the file must still be valid code: brackets and strings balanced, indentation consistent, no line duplicated or lost.
 To comment on the change as a whole rather than a line, use \"path\": \"\" and \"line\": 0."
   "Description of the note format given to the agent.")
 
@@ -84,6 +84,23 @@ To comment on the change as a whole rather than a line, use \"path\": \"\" and \
                                    (agent-notes--first-line note 100)))
                          notes "")))))
 
+(defun agent-notes--diagram-format ()
+  "Return the format of diagrams: `graphviz' or `text'."
+  (pcase agent-notes-diagram-format
+    ('auto (if (executable-find agent-notes-dot-program) 'graphviz 'text))
+    (format format)))
+
+(defun agent-notes--diagram-prompt ()
+  "Return the instructions for drawing diagrams."
+  (if (eq (agent-notes--diagram-format) 'graphviz)
+      (concat "When you draw a diagram, write it in Graphviz DOT in a ```dot fenced block; "
+              "the editor renders it as an image. Use one digraph with rankdir=TB (or LR "
+              "when that is clearer), node [shape=box], short labels and at most about 15 "
+              "nodes. Do not set colors, fonts or sizes, and do not use HTML labels. Mark "
+              "new parts with style=bold and changed parts with style=dashed.")
+    (concat "When you draw a diagram, draw it as plain text with Unicode box-drawing "
+            "characters and arrows, in a ```text fenced block at most 78 columns wide.")))
+
 (defun agent-notes--task-prompt (task)
   "Return the prompt asking the agent to do TASK, a (NAME . INSTRUCTIONS)."
   (concat
@@ -95,7 +112,8 @@ To comment on the change as a whole rather than a line, use \"path\": \"\" and \
    (agent-notes--existing-notes-prompt)
    "\nDo not modify any files for this task unless the task explicitly asks you to.\n"
    "The summary is shown as Markdown in a plain-text editor: use short paragraphs, "
-   "bullet points and fenced code blocks, but no tables, images or HTML.\n\n"
+   "bullet points and fenced code blocks, but no tables, images or HTML.\n"
+   (agent-notes--diagram-prompt) "\n\n"
    agent-notes--note-spec "\n\n"
    (agent-notes--json-instructions
     (concat "{\"summary\": \"...\",\n"
@@ -124,9 +142,9 @@ To comment on the change as a whole rather than a line, use \"path\": \"\" and \
      (let ((suggestion (plist-get note :suggestion)))
        (if (not (stringp suggestion))
            ""
-         (format "Your suggested replacement for %s (%s):\n%s\n"
-                 (agent-notes--plural (or (plist-get note :span) 1) "line")
+         (format "Your suggested change (%s) replaces:\n%s\nwith:\n%s\n"
                  (if (plist-get note :applied) "the user applied it" "not applied")
+                 (or (plist-get note :original) "")
                  suggestion)))
      (mapconcat (lambda (c)
                   (format "[%s%s]\n%s\n"
@@ -153,8 +171,9 @@ To comment on the change as a whole rather than a line, use \"path\": \"\" and \
                "the notes move with the code. ")
      "")
    "When a message asks for a suggestion rather than a change, add \"suggestion\" and "
-   "\"end_line\" to your reply instead, with the same meaning as in a note, counted from "
-   "the thread's line; the user can then apply it with one key.\n\n"
+   "\"original\" to your reply instead, with the same meaning as in a note; the user can "
+   "then apply it with one key.\n"
+   (agent-notes--diagram-prompt) "\n\n"
    (mapconcat (lambda (note) (agent-notes--format-thread note new-ids)) notes "")
    agent-notes--note-spec "\n\n"
    (agent-notes--json-instructions
@@ -180,23 +199,91 @@ To comment on the change as a whole rather than a line, use \"path\": \"\" and \
             (and beg end (< beg end) (parse (substring text beg (1+ end)))))
           (error "Could not find a JSON object in the agent's answer")))))
 
-(defun agent-notes--set-suggestion (note suggestion end-line)
-  "Attach SUGGESTION to NOTE, replacing its line through END-LINE.
-Return non-nil if NOTE can take a suggestion and SUGGESTION is one."
+(defvar agent-notes--dropped-suggestions nil
+  "Ids of the notes whose suggested change was dropped.
+Bound while applying an answer of the agent.")
+
+(defun agent-notes--absorb-context (lines start span new)
+  "Widen the lines START to START+SPAN-1 of LINES to the context in NEW.
+LINES is the file and NEW the suggested code, as lists of lines.
+When NEW begins with the lines just above that region, or ends with
+the lines just below it, the agent repeated them for context: they
+are added to the region, so that they are not duplicated.  Return
+\(START . SPAN) of the widened region."
+  (let* ((file (vconcat lines))
+         (new (vconcat new))
+         (n (length new))
+         (above 0)
+         (below 0))
+    (cl-flet ((same (a b) (agent-notes--same-line-p a b))
+              ;; Whether new lines FROM..FROM+K-1 equal the file's lines
+              ;; from AT, and are not all blank.
+              (repeats (from k at)
+                (and (cl-loop for j below k
+                              always (agent-notes--same-line-p (aref new (+ from j))
+                                                               (aref file (+ at j))))
+                     (cl-loop for j below k
+                              thereis (not (string-blank-p (aref new (+ from j))))))))
+      ;; START and the region are 1-based; the vectors are 0-based.
+      (unless (same (aref new 0) (aref file (1- start)))
+        (cl-loop for k from 1 to (min (1- n) (1- start))
+                 when (repeats 0 k (- start 1 k))
+                 do (setq above k)))
+      (let ((after (+ start span -1)))
+        (unless (same (aref new (1- n)) (aref file (1- after)))
+          (cl-loop for k from 1 to (min (- n above 1) (- (length file) after))
+                   when (repeats (- n k) k after)
+                   do (setq below k)))))
+    (cons (- start above) (+ span above below))))
+
+(defun agent-notes--set-suggestion (note suggestion original &optional end-line)
+  "Attach SUGGESTION, the code that replaces ORIGINAL, to NOTE.
+ORIGINAL is the text the agent says it replaces; it is looked up in
+the file, nearest to the note's line.  Without ORIGINAL, the note's
+line through END-LINE is replaced, widened by the context lines that
+SUGGESTION repeats.  Return non-nil if the suggestion was attached.
+When the code to replace is not in the file, the suggestion is
+dropped and the note's id is added to
+`agent-notes--dropped-suggestions'."
   (when (and (stringp suggestion)
              (not (string-blank-p suggestion))
              (equal (plist-get note :side) "new")
              (not (agent-notes--general-p note))
              (> (plist-get note :line) 0))
     (let* ((line (plist-get note :line))
-           (end (if end-line (agent-notes--as-int end-line) line))
-           (span (max 1 (min 500 (1+ (- end line))))))
-      (plist-put note :suggestion (string-remove-suffix "\n" suggestion))
-      (plist-put note :span span)
-      ;; The code it replaces, to check that it is still there when applied.
-      (plist-put note :original (agent-notes--file-lines (plist-get note :path) line span))
-      (plist-put note :applied nil)
-      t)))
+           (lines (agent-notes--read-lines (plist-get note :path)))
+           (new (agent-notes--split-lines suggestion))
+           (region
+            (cond ((null lines) nil)
+                  ((and (stringp original) (not (string-blank-p original)))
+                   (let* ((target (agent-notes--split-lines original))
+                          (start (agent-notes--locate-lines lines target line)))
+                     (and start (cons start (length target)))))
+                  (t
+                   (let* ((end (if end-line (agent-notes--as-int end-line) line))
+                          (span (max 1 (min 500 (1+ (- end line))))))
+                     (and (<= (+ line span -1) (length lines))
+                          (agent-notes--absorb-context lines line span new)))))))
+      (if (not region)
+          (progn (push (plist-get note :id) agent-notes--dropped-suggestions)
+                 nil)
+        (plist-put note :suggestion (string-remove-suffix "\n" suggestion))
+        (plist-put note :span (cdr region))
+        ;; The exact code it replaces, looked up again when applied.
+        (plist-put note :original
+                   (string-join (seq-subseq lines (1- (car region))
+                                            (+ (car region) (cdr region) -1))
+                                "\n"))
+        (plist-put note :applied nil)
+        t))))
+
+(defun agent-notes--describe-dropped ()
+  "Describe `agent-notes--dropped-suggestions' for the log."
+  (if (null agent-notes--dropped-suggestions)
+      ""
+    (format "\nIgnored the suggested change of %s: the code it replaces is not in the file."
+            (mapconcat (lambda (id) (format "#%d" id))
+                       (reverse agent-notes--dropped-suggestions) ", "))))
 
 (defun agent-notes--add-agent-note (spec)
   "Add the note described by the agent's JSON SPEC; return it or nil."
@@ -210,7 +297,8 @@ Return non-nil if NOTE can take a suggestion and SUGGESTION is one."
                    (agent-notes--as-int (plist-get spec :line))
                    (if (stringp severity) severity "suggestion")
                    body "sent")))
-        (agent-notes--set-suggestion note (plist-get spec :suggestion) (plist-get spec :end_line))
+        (agent-notes--set-suggestion note (plist-get spec :suggestion) (plist-get spec :original)
+                                     (plist-get spec :end_line))
         note))))
 
 (defun agent-notes--describe-new-notes (notes)
@@ -227,9 +315,10 @@ Return non-nil if NOTE can take a suggestion and SUGGESTION is one."
 Return a description of what changed."
   (unless (or (plist-member data :notes) (plist-member data :summary))
     (error "The agent's answer has no \"notes\""))
-  (let ((summary (plist-get data :summary))
-        (added (delq nil (mapcar #'agent-notes--add-agent-note (plist-get data :notes))))
-        (has-summary nil))
+  (let* ((agent-notes--dropped-suggestions nil)
+         (summary (plist-get data :summary))
+         (added (delq nil (mapcar #'agent-notes--add-agent-note (plist-get data :notes))))
+         (has-summary nil))
     (when (and (stringp summary) (not (string-blank-p summary)))
       (setq has-summary t)
       (setq agent-notes--review
@@ -240,7 +329,8 @@ Return a description of what changed."
     (concat (agent-notes--capitalize-first
              (or (agent-notes--describe-new-notes added) "added no notes"))
             (if has-summary " and a summary" "")
-            ".")))
+            "."
+            (agent-notes--describe-dropped))))
 
 (defun agent-notes--capitalize-first (string)
   "Return STRING with its first letter in upper case."
@@ -256,7 +346,8 @@ Return a description of what changed."
     (dolist (comment (plist-get note :comments))
       (when (memq (plist-get comment :id) in-flight)
         (plist-put comment :state "sent"))))
-  (let ((answered 0) (resolved 0) (suggested 0) (unknown nil))
+  (let ((agent-notes--dropped-suggestions nil)
+        (answered 0) (resolved 0) (suggested 0) (unknown nil))
     (dolist (reply (plist-get data :replies))
       (let ((note (agent-notes--note (agent-notes--as-int (plist-get reply :note))))
             (body (plist-get reply :body)))
@@ -268,6 +359,7 @@ Return a description of what changed."
                        (append (plist-get note :comments)
                                (list (agent-notes--make-comment "agent" body "sent")))))
           (when (agent-notes--set-suggestion note (plist-get reply :suggestion)
+                                             (plist-get reply :original)
                                              (plist-get reply :end_line))
             (cl-incf suggested))
           (when (and (plist-get reply :resolve) (not (agent-notes--resolved-p note)))
@@ -282,7 +374,8 @@ Return a description of what changed."
               (if unknown
                   (format "\nIgnored replies to notes that don't exist: %s."
                           (string-join (nreverse unknown) ", "))
-                "")))))
+                "")
+              (agent-notes--describe-dropped)))))
 
 ;;;; Running Copilot
 
@@ -451,10 +544,58 @@ Your comments stay unsent; you can send them again."
 
 ;;;; Suggested changes
 
+(defun agent-notes--code-state ()
+  "Return the state of the code in the current buffer, for sanity checks."
+  (let ((ppss (save-excursion (syntax-ppss (point-max)))))
+    (list :depth (nth 0 ppss)
+          :open (and (or (nth 3 ppss) (nth 4 ppss)) t)
+          :parse-error
+          (ignore-errors
+            (and (fboundp 'treesit-parser-list)
+                 (treesit-parser-list)
+                 (treesit-node-check (treesit-buffer-root-node) 'has-error))))))
+
+(defun agent-notes--line-at (n)
+  "Return line N of the current buffer, or nil if there is none."
+  (save-excursion
+    (goto-char (point-min))
+    (when (and (> n 0) (zerop (forward-line (1- n))) (not (eobp)))
+      (buffer-substring-no-properties (point) (line-end-position)))))
+
+(defun agent-notes--replacement-problems (before start old new)
+  "Return what may be wrong after replacing the lines OLD with NEW.
+The replacement starts at line START of the current buffer.  OLD and
+NEW are lists of lines; BEFORE is `agent-notes--code-state' before."
+  (let* ((after (agent-notes--code-state))
+         (above (agent-notes--line-at (1- start)))
+         (below (agent-notes--line-at (+ start (length new))))
+         (problems nil))
+    (cl-flet ((twice (line neighbor old-edge)
+                (and (not (string-blank-p line))
+                     (agent-notes--same-line-p line neighbor)
+                     (not (agent-notes--same-line-p old-edge neighbor)))))
+      (unless (equal (plist-get before :depth) (plist-get after :depth))
+        (push "the brackets no longer balance" problems))
+      (when (and (plist-get after :open) (not (plist-get before :open)))
+        (push "a string or comment is left open" problems))
+      (when (and (plist-get after :parse-error) (not (plist-get before :parse-error)))
+        (push "the parser now finds a syntax error" problems))
+      (when (twice (car new) above (car old))
+        (push (format "line %d would appear twice: %s" (1- start) (string-trim above))
+              problems))
+      (when (twice (car (last new)) below (car (last old)))
+        (push (format "line %d would appear twice: %s" (+ start (length new))
+                      (string-trim below))
+              problems)))
+    (nreverse problems)))
+
 (defun agent-notes-apply-suggestion ()
   "Apply the change suggested in the note at point and resolve the note.
-The file is changed and saved; undo in its buffer if needed.  The
-diff is then refreshed."
+The code the suggestion replaces is looked up in the file, near the
+note.  If the result looks broken (unbalanced brackets, a syntax
+error, a duplicated line), you are asked whether to keep it.  The
+file is then saved; undo in its buffer if needed.  The diff is
+refreshed."
   (interactive)
   (agent-notes--ensure-idle)
   (let* ((note (agent-notes--require-note))
@@ -463,9 +604,11 @@ diff is then refreshed."
                          (user-error "Note #%d has no suggested change" id)))
          (path (plist-get note :path))
          (line (plist-get note :line))
-         (span (or (plist-get note :span) 1))
-         (original (plist-get note :original))
-         (file (expand-file-name path (plist-get agent-notes--review :root))))
+         (original (or (plist-get note :original)
+                       (user-error "The suggestion of #%d does not say what it replaces; \
+ask the agent for a new one" id)))
+         (file (expand-file-name path (plist-get agent-notes--review :root)))
+         (start nil))
     (when (plist-get note :applied)
       (user-error "The suggestion of #%d is already applied" id))
     (when (plist-get note :outdated)
@@ -478,20 +621,34 @@ diff is then refreshed."
       (save-excursion
         (save-restriction
           (widen)
-          (goto-char (point-min))
-          (unless (and (zerop (forward-line (1- line))) (not (eobp)))
-            (user-error "%s has no line %d; press g to refresh the diff" path line))
-          (let* ((beg (point))
-                 (end (progn (forward-line (1- span)) (line-end-position)))
-                 (current (buffer-substring-no-properties beg end)))
-            (unless (if original
-                        (equal current original)
-                      (equal (car (split-string current "\n")) (plist-get note :text)))
-              (user-error "Lines %d-%d of %s are not the code the suggestion is for; \
-press g to refresh the diff" line (+ line span -1) path))
+          (let* ((old (agent-notes--split-lines original))
+                 (new (agent-notes--split-lines suggestion))
+                 (before (agent-notes--code-state))
+                 beg end old-text problems)
+            (setq start (or (agent-notes--locate-lines
+                             (split-string (buffer-substring-no-properties (point-min) (point-max))
+                                           "\n")
+                             old line)
+                            (user-error "%s no longer has the code the suggestion of #%d \
+replaces; press g to refresh the diff" path id)))
+            (goto-char (point-min))
+            (forward-line (1- start))
+            (setq beg (point))
+            (forward-line (1- (length old)))
+            (setq end (line-end-position)
+                  old-text (buffer-substring beg end))
             (delete-region beg end)
             (goto-char beg)
-            (insert suggestion))))
+            (insert suggestion)
+            (setq problems (agent-notes--replacement-problems before start old new))
+            (when (and problems
+                       (not (y-or-n-p (format "The suggestion of #%d may break the code (%s).  \
+Keep it? " id (string-join problems "; ")))))
+              (delete-region beg (point))
+              (goto-char beg)
+              (insert old-text)
+              (set-buffer-modified-p nil)
+              (user-error "Left %s unchanged" path)))))
       (save-buffer))
     (plist-put note :applied t)
     (plist-put note :status "resolved")
@@ -501,7 +658,7 @@ press g to refresh the diff" line (+ line span -1) path))
                              (agent-notes--describe-moves (agent-notes--resnapshot)))
                    (error (format "could not refresh the diff: %s" (error-message-string err))))))
       (agent-notes--log "You" (format "Applied the suggestion of #%d to %s:%d and resolved it; %s."
-                                      id path line moves)))
+                                      id path start moves)))
     (agent-notes--render)
     (let ((section (agent-notes--note-section id)))
       (when section (magit-section-hide section)))

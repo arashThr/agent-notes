@@ -84,7 +84,7 @@ Press `?` (or `h`) for a menu with all of these.
 | `s`             | Send all unsent comments to the agent                                                                               |
 | `A`             | Give the agent a task                                                                                               |
 | `g`             | Refresh the diff (same scope and base) and move notes with their code                                               |
-| `RET` / `o`     | Open the file at that line, to read or edit it                                                                      |
+| `RET` / `o`     | Open the file at that line, to read or edit it (on a diagram: open its Graphviz source)                             |
 | `$`             | Show the log: what was sent, how long it took, what came back and what changed                                      |
 | `x` / `C-c C-k` | Abort the running agent request                                                                                     |
 
@@ -98,11 +98,17 @@ While the agent is working, saving doesn't refresh. Its changes are picked up wh
 
 ### Suggested changes
 
-When the agent knows the exact fix for a few lines, its note shows a "Suggested change" with the old lines (`-`) and the new ones (`+`). Press `a` on the note to apply it. The file is changed and saved, the note is resolved, and the diff refreshes. Undo works as usual in the file's buffer. If the code has changed since the suggestion was made, `a` refuses instead of guessing. You can also ask for a suggestion in a reply ("suggest a fix") rather than asking the agent to edit.
+When the agent knows the exact fix for a few lines, its note shows a "Suggested change" with the old lines (`-`) and the new ones (`+`). Press `a` on the note to apply it. The file is changed and saved, the note is resolved, and the diff refreshes. Undo works as usual in the file's buffer. You can also ask for a suggestion in a reply ("suggest a fix") rather than asking the agent to edit.
+
+Applying works like search and replace, not by line numbers. The agent gives the exact lines it replaces (`original`) along with the new code, and `a` looks for those lines in the file, near the note. The `-` lines are exactly what gets replaced. If the agent repeats a neighbouring line for context, such as the function's signature, that line is part of what's replaced and does not end up in the file twice. Suggestions whose `original` is not in the file are dropped, and the log says so. If the code changed after the suggestion was made, `a` refuses instead of guessing.
+
+Before saving, `a` checks the result. It looks for brackets or strings that no longer balance, a new syntax error (in tree-sitter modes), or a line that now appears twice. If it finds one, it asks whether to keep the change; answering `n` leaves the file as it was.
 
 ### Diagrams
 
-The Overview and Diagram tasks can draw plain-text box-and-arrow diagrams in the summary. Code blocks in summaries are cut at the window edge instead of wrapping, so the drawings stay intact. You can also type your own instructions, such as "draw how a request flows through the new middleware".
+The Overview and Diagram tasks can draw a diagram at the top of the summary. You can also type your own instructions, such as "draw how a request flows through the new middleware".
+
+If [Graphviz](https://graphviz.org) is installed (`brew install graphviz`), the agent writes diagrams in DOT and they are shown as images in the colours of your theme. New parts are drawn **bold** and changed parts dashed. Press `RET` on a diagram to open its source, in `graphviz-dot-mode` if you have it; there, `C-c C-p` shows a zoomable preview. Without Graphviz, or in a terminal, the agent draws plain-text box-and-arrow diagrams instead. Code blocks are cut at the window edge instead of wrapping, so these drawings stay intact. `agent-notes-diagram-format` chooses between the two.
 
 ### When you are done
 
@@ -126,7 +132,7 @@ When every note is resolved and nothing is unsent, the review says so, and the M
 
 ## How it works
 
-- **Storage.** Every review is stored in `.git/agent-notes/<id>.json`, with a snapshot of the diff in `<id>.diff`. Nothing is committed.
+- **Storage.** Every review is stored in `.git/agent-notes/<id>.json`, with a snapshot of the diff in `<id>.diff`. Nothing is committed. Git never pushes anything inside `.git/`, so reviews stay on your machine: other clones don't see them, and each clone or worktree has its own.
 - **Sessions.** Each review has its own Copilot session (`copilot --session-id <uuid>`), so the agent remembers the review when you reply.
 - **Permissions.** Copilot runs non-interactively (`copilot -p`) and may:
   - read files and run the read-only commands in `agent-notes-allowed-tools`;
@@ -150,6 +156,7 @@ When every note is resolved and nothing is unsent, the review says so, and the M
 - `agent-notes-refresh-on-save`: refresh reviews when you save a file of the repository
 - `agent-notes-copilot-extra-args`: for example `'("--model" "gpt-5")`
 - `agent-notes-base-branch`: the default base branch for branch reviews
+- `agent-notes-diagram-format`: `auto` (Graphviz if `dot` is installed), `graphviz` or `text`; `agent-notes-dot-program` is the Graphviz program
 
 ## Development
 

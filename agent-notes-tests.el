@@ -273,7 +273,14 @@ REVIEW-EXTRA is a plist merged into the stored review."
       (should (member "--deny-tool=write" (agent-notes--copilot-args "x")))
       (should-not (member "--allow-tool=write" (agent-notes--copilot-args "x")))
       (should (string-search "cannot modify files" (agent-notes--reply-prompt nil nil))))
-    (should (equal (last (agent-notes--copilot-args "the prompt") 2) '("-p" "the prompt")))))
+    (should (equal (last (agent-notes--copilot-args "the prompt") 2) '("-p" "the prompt")))
+    (let ((agent-notes-diagram-format 'graphviz))
+      (should (string-search "```dot" (agent-notes--task-prompt '("Mine" . "x"))))
+      (should (string-search "```dot" (agent-notes--reply-prompt nil nil))))
+    (let ((agent-notes-diagram-format 'text))
+      (should (string-search "```text" (agent-notes--task-prompt '("Mine" . "x"))))
+      (should-not (string-search "```dot" (agent-notes--task-prompt '("Mine" . "x")))))
+    (should (string-search "\"original\"" (agent-notes--task-prompt '("Mine" . "x"))))))
 
 (ert-deftest agent-notes-test-general-note ()
   (agent-notes-tests--with-review nil
@@ -477,6 +484,102 @@ It runs SHELL, prints ANSWER and ignores its arguments."
     (should (equal (car (last (agent-notes-tests--stages))) "You"))
     (agent-notes--goto-note 1)
     (should-error (agent-notes-apply-suggestion) :type 'user-error)))
+
+(ert-deftest agent-notes-test-suggestion-with-context ()
+  (agent-notes-tests--with-repo
+    ;; The agent repeats line 10 for context and says so in "original";
+    ;; trailing spaces in "original" don't matter.
+    (agent-notes--apply-review
+     '(:notes ((:path "src/auth.py" :line 11 :side "new" :body "Locked"
+                :original "    token = make_token(user)  \n    if user.disabled:"
+                :suggestion "    token = make_token(user)\n    if user.disabled or user.locked:")
+               ;; Without "original": the repeated line 10 is absorbed.
+               (:path "src/auth.py" :line 11 :end_line 12 :side "new" :body "Legacy"
+                :suggestion "    token = make_token(user)\n    if user.locked:\n        return None")
+               ;; Repeated lines below the region are absorbed too.
+               (:path "src/auth.py" :line 11 :side "new" :body "Below"
+                :suggestion "    if x:\n        return None\n    return token")))
+     "Review")
+    (should (equal (plist-get (agent-notes--note 1) :original)
+                   "    token = make_token(user)\n    if user.disabled:"))
+    (should (equal (plist-get (agent-notes--note 2) :original)
+                   "    token = make_token(user)\n    if user.disabled:\n        return None"))
+    (should (equal (plist-get (agent-notes--note 3) :original)
+                   "    if user.disabled:\n        return None\n    return token"))
+    (agent-notes--render)
+    (agent-notes--goto-note 1)
+    (agent-notes-apply-suggestion)
+    (should (equal (agent-notes--read-file "src/auth.py")
+                   (replace-regexp-in-string "user.disabled:" "user.disabled or user.locked:"
+                                             agent-notes-tests--auth-new)))))
+
+(ert-deftest agent-notes-test-suggestion-not-found ()
+  (agent-notes-tests--with-repo
+    (let ((result (agent-notes--apply-review
+                   '(:notes ((:path "src/auth.py" :line 11 :side "new" :body "Gone"
+                              :original "    if user.banned:"
+                              :suggestion "    if user.banned or user.locked:")))
+                   "Review")))
+      (should-not (plist-get (agent-notes--note 1) :suggestion))
+      (should (string-search "Ignored the suggested change of #1" result)))))
+
+(ert-deftest agent-notes-test-suggestion-sanity-checks ()
+  (agent-notes-tests--with-repo
+    (agent-notes--apply-review
+     '(:notes ((:path "src/auth.py" :line 11 :side "new" :body "Duplicates line 10"
+                :original "    if user.disabled:"
+                :suggestion "    token = make_token(user)\n    if user.locked:")
+               (:path "src/auth.py" :line 11 :side "new" :body "Unbalanced"
+                :original "    if user.disabled:"
+                :suggestion "    if (user.disabled:")))
+     "Review")
+    (agent-notes--render)
+    (let ((asked nil))
+      ;; Refused: the file is left as it was.
+      (cl-letf (((symbol-function 'y-or-n-p) (lambda (prompt) (setq asked prompt) nil)))
+        (agent-notes--goto-note 1)
+        (should-error (agent-notes-apply-suggestion) :type 'user-error)
+        (should (string-search "would appear twice" asked))
+        (should (equal (agent-notes--read-file "src/auth.py") agent-notes-tests--auth-new))
+        (should-not (buffer-modified-p (find-buffer-visiting (expand-file-name "src/auth.py" root))))
+        (should-not (plist-get (agent-notes--note 1) :applied))
+        (agent-notes--goto-note 2)
+        (should-error (agent-notes-apply-suggestion) :type 'user-error)
+        (should (string-search "brackets" asked)))
+      ;; Accepted: applied anyway.
+      (cl-letf (((symbol-function 'y-or-n-p) (lambda (_prompt) t)))
+        (agent-notes--goto-note 2)
+        (agent-notes-apply-suggestion)
+        (should (string-search "if (user.disabled:" (agent-notes--read-file "src/auth.py")))
+        (should (plist-get (agent-notes--note 2) :applied))))))
+
+(ert-deftest agent-notes-test-graphviz-diagrams ()
+  (let ((text "Intro\n```dot\ndigraph { a -> b }\n```\nAfter"))
+    ;; Without image support, the source is shown and RET can open it.
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'agent-notes--diagram-images-p) #'ignore))
+        (agent-notes--insert-markdown text 'default "  " t))
+      (should (string-search "digraph { a -> b }" (buffer-string)))
+      (should (string-search "After" (buffer-string)))
+      (goto-char (point-min))
+      (search-forward "digraph")
+      (should (equal (get-text-property (point) 'agent-notes-diagram) "digraph { a -> b }")))
+    ;; With images, the diagram is an image.
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'agent-notes--diagram-images-p) (lambda () t))
+                ((symbol-function 'agent-notes--render-dot)
+                 (lambda (_source) "<svg xmlns=\"http://www.w3.org/2000/svg\"/>")))
+        (agent-notes--insert-markdown text 'default "  " t))
+      (should-not (string-search "digraph" (buffer-string)))
+      (goto-char (point-min))
+      (let ((match (text-property-search-forward 'display nil (lambda (_ v) v))))
+        (should match)
+        (should (eq (car-safe (prop-match-value match)) 'image))
+        (should (equal (get-text-property (prop-match-beginning match) 'agent-notes-diagram)
+                       "digraph { a -> b }")))))
+  (when (executable-find agent-notes-dot-program)
+    (should (string-search "<svg" (agent-notes--render-dot "digraph { a -> b }")))
+    (should-not (agent-notes--render-dot "this is not dot"))))
 
 (ert-deftest agent-notes-test-fake-agent-run-and-log ()
   (agent-notes-tests--with-repo

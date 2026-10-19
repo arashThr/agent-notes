@@ -348,8 +348,29 @@ With prefix argument ALL, include resolved ones."
 (defun agent-notes-visit ()
   "Open the file of the line or note at point, at that line.
 The file can be edited; when you save it, the review is refreshed
-\(see `agent-notes-refresh-on-save')."
+\(see `agent-notes-refresh-on-save').  On a diagram, open its
+Graphviz source instead."
   (interactive)
+  (let ((diagram (get-text-property (point) 'agent-notes-diagram)))
+    (if diagram
+        (agent-notes--open-diagram diagram)
+      (agent-notes--visit-code))))
+
+(declare-function graphviz-dot-mode "graphviz-dot-mode" ())
+
+(defun agent-notes--open-diagram (source)
+  "Show the Graphviz SOURCE of a diagram in another window."
+  (with-current-buffer (get-buffer-create "*agent-notes diagram*")
+    (let ((inhibit-read-only t))
+      (erase-buffer)
+      (insert source "\n"))
+    (if (fboundp 'graphviz-dot-mode) (graphviz-dot-mode) (fundamental-mode))
+    (set-buffer-modified-p nil)
+    (goto-char (point-min))
+    (pop-to-buffer (current-buffer))))
+
+(defun agent-notes--visit-code ()
+  "Open the file of the line or note at point, at that line."
   (let* ((note (and (get-text-property (point) 'agent-notes-note) (agent-notes--note-at-point)))
          (rec (if note
                   (gethash (plist-get note :id) agent-notes--placement)
