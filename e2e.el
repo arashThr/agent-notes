@@ -40,6 +40,10 @@
   (with-current-buffer buf
     (e2e-show "AFTER REPLY")
     (princ (format "\nChanged by the agent: %S\n" agent-notes--changes))))
-(princ "\n===== LOG (tail) =====\n")
-(princ (with-current-buffer agent-notes--log-buffer
-         (buffer-substring-no-properties (max (point-min) (- (point-max) 3000)) (point-max))))
+(princ "\n===== LOG =====\n")
+(with-current-buffer (car (cl-remove-if-not (lambda (b) (with-current-buffer b
+                                                         (derived-mode-p 'agent-notes-mode)))
+                                            (buffer-list)))
+  (agent-notes-show-log)
+  (princ (with-current-buffer (agent-notes--log-buffer-name)
+           (buffer-substring-no-properties (point-min) (point-max)))))

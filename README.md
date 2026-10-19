@@ -2,7 +2,7 @@
 
 Go through the changes in a git repository with an AI agent (GitHub Copilot CLI), inside Emacs.
 
-The diff is shown in a read-only, Magit-style buffer, unified or side by side. You give the agent a task, such as a bug review, an overview of the important changes, or your own instructions. Its notes appear under the lines they refer to. You can reply, add your own notes, and resolve threads. Your comments are queued, and nothing goes to the agent until you send them all with `s`. If you ask for a change, the agent edits the code. The diff then refreshes, and the notes move with the code.
+The diff is shown in a Magit-style buffer, unified or side by side, with the syntax highlighting of each file's major mode. You give the agent a task, such as a bug review, an overview of the important changes, a diagram, or your own instructions. Its notes appear under the lines they refer to. You can reply, add your own notes, and resolve threads. Your comments are queued, and nothing goes to the agent until you send them all with `s`. If you ask for a change, the agent edits the code; when it suggests a change in a note, `a` applies it. You can also edit files yourself. Either way, the diff refreshes and the notes move with the code.
 
 ```
 stats.py
@@ -55,8 +55,9 @@ The `:init` line loads the package together with Magit, so `@` works in Magit ri
 
 The task tells the agent what to do with the diff. The built-in tasks are:
 
-- **Review**: find bugs, risks and missing tests.
-- **Overview**: explain only the most important changes. The summary covers what changed and why, in reading order, and there are about 3–8 `info` notes on the key lines.
+- **Review**: find bugs, risks and missing tests. Where the fix is clear, a note carries a suggested change.
+- **Overview**: explain only the most important changes. The summary covers what changed and why, in reading order, with a small diagram when several parts interact. It adds about 3–8 `info` notes on the key lines.
+- **Diagram**: a box-and-arrow drawing of the changed parts and how they connect, with a short explanation.
 
 You can also pick "Custom instructions…" or type your own text, for example "explain how the caching works". In Vertico, use `M-RET` to submit text that partially matches a task name. Add your own tasks to `agent-notes-tasks`. Press `A` in a review to give the agent another task; new notes are added to the existing ones, and each task's summary is kept.
 
@@ -66,26 +67,62 @@ Press `?` (or `h`) for a menu with all of these.
 
 | Key             | Action                                                                                                              |
 | --------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `n` / `p`       | Next / previous note                                                                                                |
-| `N` / `P`       | Next / previous note written by the agent                                                                           |
+| `n` / `p`       | Next / previous open note. Resolved notes are skipped; with `C-u`, they are included.                               |
+| `N` / `P`       | Next / previous open note written by the agent                                                                      |
 | `M-n` / `M-p`   | Next / previous hunk, across files                                                                                  |
 | `}` / `{`       | Next / previous file                                                                                                |
-| `l`             | Jump to a note from a list                                                                                          |
+| `l`             | Jump to any note, resolved ones included, from a list                                                               |
 | `TAB`           | Fold the file, hunk or note at point. Resolved notes start folded.                                                  |
 | `^`, `1`–`4`    | Parent section, show levels (as in Magit)                                                                           |
 | `v`             | Switch between unified and side-by-side views                                                                       |
+| `#`             | Show / hide line numbers                                                                                            |
 | `c`             | New note on the line at point. In the side-by-side view, the side at point counts. Elsewhere, write a general note. |
 | `r`             | Reply to the note at point                                                                                          |
 | `e` / `k`       | Edit / delete your unsent comment (or your whole unsent note)                                                       |
 | `R`             | Resolve / reopen the note at point                                                                                  |
+| `a`             | Apply the change suggested in the note at point                                                                     |
 | `s`             | Send all unsent comments to the agent                                                                               |
 | `A`             | Give the agent a task                                                                                               |
 | `g`             | Refresh the diff (same scope and base) and move notes with their code                                               |
-| `RET` / `o`     | Open the file at that line                                                                                          |
-| `$`             | Show the log of prompts and raw agent answers                                                                       |
+| `RET` / `o`     | Open the file at that line, to read or edit it                                                                      |
+| `$`             | Show the log: what was sent, how long it took, what came back and what changed                                      |
 | `x` / `C-c C-k` | Abort the running agent request                                                                                     |
 
 In the compose buffer, `C-c C-c` saves and `C-c C-k` cancels.
+
+### Editing code during a review
+
+Press `RET` on a line or note to open the file at that line, in another window. Edit it and save. The review refreshes about half a second later, and the notes move with their code. You can turn this off with `agent-notes-refresh-on-save`, and refresh by hand with `g`.
+
+While the agent is working, saving doesn't refresh. Its changes are picked up when it finishes. Buffers of files that the agent changed are reverted if you have no unsaved edits in them; otherwise the log warns you.
+
+### Suggested changes
+
+When the agent knows the exact fix for a few lines, its note shows a "Suggested change" with the old lines (`-`) and the new ones (`+`). Press `a` on the note to apply it. The file is changed and saved, the note is resolved, and the diff refreshes. Undo works as usual in the file's buffer. If the code has changed since the suggestion was made, `a` refuses instead of guessing. You can also ask for a suggestion in a reply ("suggest a fix") rather than asking the agent to edit.
+
+### Diagrams
+
+The Overview and Diagram tasks can draw plain-text box-and-arrow diagrams in the summary. Code blocks in summaries are cut at the window edge instead of wrapping, so the drawings stay intact. You can also type your own instructions, such as "draw how a request flows through the new middleware".
+
+### When you are done
+
+When every note is resolved and nothing is unsent, the review says so, and the Magit status line shows "all resolved ✓". Commit as usual with Magit. The review stays in `.git/agent-notes/` as history and can be reopened with `o` in the menu. For the next round of changes, start a new review.
+
+### The log
+
+`$` opens a log for the review, one line per step:
+
+```
+10:02:11  Started   New review, Working tree vs HEAD: 1 file, +9 −1.
+10:02:11  Sent      Asked the agent to do the task "Overview" on the diff.
+10:03:02  Done      Copilot answered after 0:51.
+10:03:02  Applied   Added 5 notes (1 with a suggested change) and a summary.
+10:05:40  Sent      Sent your 2 comments in 2 threads (#1, #3) to the agent.
+10:06:30  Changes   The agent changed stats.py; diff refreshed, 1 note moved, 0 outdated.
+10:06:30  Applied   Answered 2 threads, resolved 1.
+```
+
+`TAB` on an entry shows its details, such as the exact prompt, the command line, and the agent's raw answer. While the agent works, the header line shows how long it has been running. The log is kept for the current Emacs session.
 
 ## How it works
 
@@ -108,10 +145,27 @@ In the compose buffer, `C-c C-c` saves and `C-c C-k` cancels.
 - `agent-notes-extra-instructions`: guidance added to every task, such as the project's conventions
 - `agent-notes-allow-edits`: whether the agent may edit files
 - `agent-notes-default-view`: `unified` or `split`
+- `agent-notes-show-line-numbers`: whether new reviews show line numbers
+- `agent-notes-syntax-highlighting`: highlight code with the file's major mode (mode hooks are not run, so no language server starts). The faces `agent-notes-added-bg` and `agent-notes-removed-bg` set the backgrounds.
+- `agent-notes-refresh-on-save`: refresh reviews when you save a file of the repository
 - `agent-notes-copilot-extra-args`: for example `'("--model" "gpt-5")`
 - `agent-notes-base-branch`: the default base branch for branch reviews
 
 ## Development
+
+The code is split by concern. Each file requires the ones above it:
+
+| File                    | Contents                                                                               |
+| ----------------------- | -------------------------------------------------------------------------------------- |
+| `agent-notes-core.el`   | Options, faces, the buffer-local state of a review, reading and writing reviews        |
+| `agent-notes-diff.el`   | Git, diff parsing, anchoring and moving notes, syntax highlighting of hunks            |
+| `agent-notes-render.el` | Drawing the review buffer: header, files, hunks, notes, both views                     |
+| `agent-notes-log.el`    | The per-review log and its buffer                                                      |
+| `agent-notes-agent.el`  | Prompts, running Copilot, applying its answers, detecting its edits, suggested changes |
+| `agent-notes-magit.el`  | `@` in Magit and `magit-dispatch`, and the status section; loaded once Magit is loaded |
+| `agent-notes.el`        | The mode, keymap, commands, menus and entry points                                     |
+
+Tests:
 
 ```sh
 emacs -Q --batch \
@@ -121,6 +175,7 @@ emacs -Q --batch \
 
 Use the same Emacs that compiled your packages. On this machine that is `/Applications/Emacs.app/Contents/MacOS/Emacs` (31.1); the `emacs` on `PATH` is 30.2 and prints harmless transient warnings.
 
+- `agent-notes-tests.el` also runs the whole request cycle against a fake `copilot` script, in a scratch git repository. It needs no Copilot requests.
 - `integ.el` checks the Magit integration and simulated agent edits, without any Copilot requests.
 - `e2e.el` runs a real Overview task and a code-change request against Copilot. It uses 2 requests.
 

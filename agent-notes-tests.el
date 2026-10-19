@@ -284,5 +284,258 @@ REVIEW-EXTRA is a plist merged into the stored review."
                            (agent-notes--reply-prompt (agent-notes--notes)
                                                       (agent-notes--pending-comments))))))
 
+(ert-deftest agent-notes-test-features ()
+  (dolist (feature '(agent-notes-core agent-notes-diff agent-notes-render
+                     agent-notes-log agent-notes-agent agent-notes))
+    (should (featurep feature)))
+  ;; The Magit part is loaded exactly when Magit is.
+  (should (eq (and (featurep 'magit) t) (and (featurep 'agent-notes-magit) t))))
+
+(ert-deftest agent-notes-test-navigation-skips-resolved ()
+  (agent-notes-tests--with-review nil
+    (agent-notes--apply-review
+     '(:notes ((:path "src/auth.py" :line 11 :side "new" :body "A")
+               (:path "src/auth.py" :line 13 :side "new" :body "B")
+               (:path "new.txt" :line 1 :side "new" :body "C")))
+     "Review")
+    (plist-put (agent-notes--note 2) :status "resolved")
+    (agent-notes--render)
+    (cl-flet ((at () (get-text-property (point) 'agent-notes-note)))
+      (goto-char (point-min))
+      (agent-notes-next-note)
+      (should (eql (at) 1))
+      (agent-notes-next-note)
+      (should (eql (at) 3))
+      (agent-notes-next-note)
+      (should (eql (at) 1))
+      ;; With a prefix argument, resolved notes count too.
+      (agent-notes-next-note '(4))
+      (should (eql (at) 2))
+      (agent-notes-previous-note)
+      (should (eql (at) 1))
+      ;; The list still offers every note.
+      (should (= (length (agent-notes--notes)) 3)))
+    (dolist (note (agent-notes--notes))
+      (plist-put note :status "resolved"))
+    (agent-notes--render)
+    (should-error (agent-notes-next-note) :type 'user-error)
+    (should (string-search "All notes are resolved" (buffer-string)))
+    (should (string-search "all 3 resolved" (agent-notes--header-line)))))
+
+(defun agent-notes-tests--faces-at (pos)
+  "Return the faces at POS as a list."
+  (ensure-list (get-text-property pos 'font-lock-face)))
+
+(ert-deftest agent-notes-test-syntax-highlighting ()
+  (agent-notes-tests--with-review nil
+    (dolist (view '(unified split))
+      (setq agent-notes--view view)
+      (agent-notes--render)
+      (goto-char (point-min))
+      (search-forward "+    if user.disabled:")
+      (let ((if-pos (- (point) (length "if user.disabled:"))))
+        ;; Python keywords keep their color; the line is marked by a background.
+        (should (memq 'font-lock-keyword-face (agent-notes-tests--faces-at if-pos)))
+        (should (memq 'agent-notes-added-bg (agent-notes-tests--faces-at if-pos)))
+        ;; The + sign has the usual diff face.
+        (should (memq 'agent-notes-added (agent-notes-tests--faces-at (- if-pos 5)))))
+      (search-forward "return token")
+      (should-not (memq 'agent-notes-added-bg
+                        (agent-notes-tests--faces-at (match-beginning 0)))))
+    (let ((agent-notes-syntax-highlighting nil))
+      (setq agent-notes--syntax-cache nil)
+      (agent-notes--render)
+      (goto-char (point-min))
+      (search-forward "+    if user.disabled:")
+      (should (equal (agent-notes-tests--faces-at (1- (point))) '(agent-notes-added))))))
+
+(ert-deftest agent-notes-test-line-numbers ()
+  (agent-notes-tests--with-review nil
+    (let ((rec (agent-notes--exact-record '(:path "src/auth.py" :side "new" :line 11))))
+      (cl-flet ((goto-rec () (goto-char (agent-notes--find-prop 'agent-notes-loc rec))))
+        (goto-rec)
+        (should (looking-at " +11 \\+    if"))
+        (agent-notes-toggle-line-numbers)
+        (goto-rec)
+        (should (looking-at "\\+    if"))
+        (should (= (length agent-notes--pad) 2))
+        ;; Side by side: the row starts with the removed line, no number.
+        (agent-notes-toggle-view)
+        (goto-char (agent-notes--find-prop
+                    'agent-notes-loc
+                    (agent-notes--exact-record '(:path "src/auth.py" :side "old" :line 11))))
+        (should (looking-at "-    log(token)"))
+        (agent-notes-toggle-line-numbers)
+        (should (> agent-notes--gutter 0))))))
+
+(ert-deftest agent-notes-test-diagram-does-not-wrap ()
+  (agent-notes-tests--with-review nil
+    (agent-notes--apply-review
+     `(:summary ,(concat "Overview:\n```text\n┌──┐\n" (make-string 300 ?x) "\n└──┘\n```\nDone.")
+       :notes nil)
+     "Diagram")
+    (agent-notes--render)
+    (should (string-search "┌──┐" (buffer-string)))
+    (goto-char (point-min))
+    (search-forward "xxx")
+    (should (<= (- (line-end-position) (line-beginning-position)) agent-notes--width))
+    (should (string-suffix-p "…" (buffer-substring (line-beginning-position) (line-end-position))))))
+
+;;;; Tests with a real git repository
+
+(defconst agent-notes-tests--auth-old
+  (concat (mapconcat (lambda (i) (format "# line %d\n" i)) (number-sequence 1 9) "")
+          "    token = make_token(user)\n    log(token)\n    return token\n"))
+
+(defconst agent-notes-tests--auth-new
+  (concat (mapconcat (lambda (i) (format "# line %d\n" i)) (number-sequence 1 9) "")
+          "    token = make_token(user)\n    if user.disabled:\n        return None\n    return token\n"))
+
+(defmacro agent-notes-tests--with-repo (&rest body)
+  "Run BODY in a new review of a scratch git repository.
+In the repository, src/auth.py is changed as in `agent-notes-tests--diff'.
+BODY can use `root' and `tmp', a directory outside the repository."
+  (declare (indent 0))
+  `(let* ((root (file-name-as-directory (file-truename (make-temp-file "agent-notes-repo" t))))
+          (tmp (file-name-as-directory (make-temp-file "agent-notes-tmp" t)))
+          (default-directory root)
+          (process-environment (append '("GIT_AUTHOR_NAME=t" "GIT_AUTHOR_EMAIL=t@t"
+                                         "GIT_COMMITTER_NAME=t" "GIT_COMMITTER_EMAIL=t@t")
+                                       process-environment)))
+     (unwind-protect
+         (progn
+           (make-directory "src")
+           (agent-notes--write-file "src/auth.py" agent-notes-tests--auth-old)
+           (agent-notes--git "init" "-q")
+           (agent-notes--git "add" ".")
+           (agent-notes--git "-c" "commit.gpgsign=false" "commit" "-q" "--no-verify" "-m" "init")
+           (agent-notes--write-file "src/auth.py" agent-notes-tests--auth-new)
+           (with-current-buffer (agent-notes--create-review "working" nil)
+             (unwind-protect (progn ,@body)
+               (let ((file-buf (find-buffer-visiting (expand-file-name "src/auth.py" root))))
+                 (when file-buf
+                   (with-current-buffer file-buf (set-buffer-modified-p nil))
+                   (kill-buffer file-buf)))
+               (when (process-live-p agent-notes--process)
+                 (delete-process agent-notes--process))
+               (kill-buffer))))
+       (delete-directory root t)
+       (delete-directory tmp t))))
+
+(defun agent-notes-tests--fake-agent (dir answer &optional shell)
+  "Write a fake Copilot to DIR and return its file name.
+It runs SHELL, prints ANSWER and ignores its arguments."
+  (let ((file (expand-file-name "fake-copilot" dir)))
+    (agent-notes--write-file file (concat "#!/bin/sh\n" (or shell "") "\ncat <<'EOF'\n" answer "\nEOF\n"))
+    (set-file-modes file #o755)
+    file))
+
+(defun agent-notes-tests--wait ()
+  "Wait until the agent of the current review buffer is done."
+  (let ((start (float-time)))
+    (while (and agent-notes--status (< (- (float-time) start) 30))
+      (accept-process-output nil 0.05))))
+
+(defun agent-notes-tests--stages ()
+  "Return the stages of the log entries of the current review."
+  (mapcar (lambda (e) (plist-get e :stage)) agent-notes--log-entries))
+
+(ert-deftest agent-notes-test-apply-suggestion ()
+  (agent-notes-tests--with-repo
+    (agent-notes--apply-review
+     '(:notes ((:path "src/auth.py" :line 11 :end_line 12 :side "new" :body "Locked users too"
+                :suggestion "    if user.disabled or user.locked:\n        return None\n")
+               (:path "src/auth.py" :line 10 :side "new" :body "Name it"
+                :suggestion "    session_token = make_token(user)")
+               (:path "src/auth.py" :line 11 :side "old" :body "Old side"
+                :suggestion "ignored")))
+     "Review")
+    (agent-notes--render)
+    (should (equal (plist-get (agent-notes--note 1) :original)
+                   "    if user.disabled:\n        return None"))
+    (should (= (plist-get (agent-notes--note 1) :span) 2))
+    (should-not (plist-get (agent-notes--note 3) :suggestion))
+    (should (string-search "Suggested change" (buffer-string)))
+    (should (string-search "+    if user.disabled or user.locked:" (buffer-string)))
+    ;; The file no longer has the code the second suggestion is for.
+    (agent-notes--write-file "src/auth.py"
+                             (replace-regexp-in-string "make_token" "new_token"
+                                                       agent-notes-tests--auth-new))
+    (agent-notes--goto-note 2)
+    (should-error (agent-notes-apply-suggestion) :type 'user-error)
+    (kill-buffer (find-buffer-visiting (expand-file-name "src/auth.py" root)))
+    (agent-notes--write-file "src/auth.py" agent-notes-tests--auth-new)
+    ;; Apply the first one.
+    (agent-notes--goto-note 1)
+    (agent-notes-apply-suggestion)
+    (should (string-search "    token = make_token(user)\n    if user.disabled or user.locked:\n        return None\n    return token\n"
+                           (agent-notes--read-file "src/auth.py")))
+    (should (plist-get (agent-notes--note 1) :applied))
+    (should (agent-notes--resolved-p (agent-notes--note 1)))
+    (should (string-search "+    if user.disabled or user.locked:" (agent-notes--stored-diff)))
+    (should (string-search "suggestion applied" (buffer-string)))
+    (should (equal (car (last (agent-notes-tests--stages))) "You"))
+    (agent-notes--goto-note 1)
+    (should-error (agent-notes-apply-suggestion) :type 'user-error)))
+
+(ert-deftest agent-notes-test-fake-agent-run-and-log ()
+  (agent-notes-tests--with-repo
+    (let ((agent-notes-copilot-program
+           (agent-notes-tests--fake-agent
+            tmp (concat "I looked at it.\n```json\n"
+                        "{\"summary\": \"Adds a check.\\n```text\\n[a] --> [b]\\n```\","
+                        " \"notes\": [{\"path\": \"src/auth.py\", \"line\": 11, \"side\": \"new\","
+                        " \"severity\": \"warning\", \"body\": \"Locked users?\","
+                        " \"suggestion\": \"    if user.disabled or user.locked:\"}]}\n```"))))
+      (agent-notes--start-task (assoc "Overview" agent-notes-tasks))
+      (should agent-notes--status)
+      (should (string-search "Overview" (agent-notes--header-line)))
+      (agent-notes-tests--wait)
+      (should-not agent-notes--status)
+      (should (= (length (agent-notes--notes)) 1))
+      (should (equal (plist-get (agent-notes--note 1) :original) "    if user.disabled:"))
+      (should (string-search "[a] --> [b]" (buffer-string)))
+      (should (equal (agent-notes-tests--stages) '("Started" "Sent" "Done" "Applied")))
+      (should (equal (plist-get (car (last agent-notes--log-entries)) :text)
+                     "Added 1 note (1 with a suggested change) and a summary."))
+      ;; The log buffer shows the entries, with the details folded.
+      (agent-notes-show-log)
+      (with-current-buffer (agent-notes--log-buffer-name)
+        (let ((text (buffer-string)))
+          (should (string-search "Copilot answered after" text))
+          (should (string-search "Raw answer" text)))
+        (kill-buffer)))
+    ;; A reply that makes the agent edit the file.
+    (let ((agent-notes-copilot-program
+           (agent-notes-tests--fake-agent
+            tmp (concat "```json\n{\"replies\": [{\"note\": 1, \"body\": \"Done.\", \"resolve\": true},"
+                        " {\"note\": 99, \"body\": \"?\"}]}\n```")
+            "printf '# edited\\n' >> src/auth.py")))
+      (let* ((comment (agent-notes--make-comment "you" "Please fix it." "pending"))
+             (ids (list (plist-get comment :id))))
+        (plist-put (agent-notes--note 1) :comments
+                   (append (plist-get (agent-notes--note 1) :comments) (list comment)))
+        (agent-notes--run "replying" (agent-notes--reply-prompt (agent-notes--notes) ids)
+                          #'agent-notes--apply-replies ids))
+      (agent-notes-tests--wait)
+      (should (equal agent-notes--changes '("src/auth.py")))
+      (should (string-search "+# edited" (agent-notes--stored-diff)))
+      (should (agent-notes--resolved-p (agent-notes--note 1)))
+      (should (null (agent-notes--pending-comments)))
+      (should (member "Changes" (agent-notes-tests--stages)))
+      (should (string-search "Ignored replies to notes that don't exist: 99"
+                             (plist-get (car (last agent-notes--log-entries)) :text))))
+    ;; A failing agent is logged with its output.
+    (let ((agent-notes-copilot-program (expand-file-name "failing-copilot" tmp)))
+      (agent-notes--write-file agent-notes-copilot-program
+                               "#!/bin/sh\necho 'Error: not signed in' >&2\nexit 3\n")
+      (set-file-modes agent-notes-copilot-program #o755)
+      (agent-notes--start-task '("Mine" . "Explain."))
+      (agent-notes-tests--wait)
+      (let ((last (car (last agent-notes--log-entries))))
+        (should (equal (plist-get last :stage) "Failed"))
+        (should (string-search "code 3" (plist-get last :text)))
+        (should (string-search "not signed in" (plist-get last :text)))))))
+
 (provide 'agent-notes-tests)
 ;;; agent-notes-tests.el ends here

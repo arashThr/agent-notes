@@ -7,6 +7,7 @@
 (require 'magit)
 (require 'agent-notes)
 
+(princ (format "agent-notes-magit loaded: %S\n" (featurep 'agent-notes-magit)))
 (princ (format "@ in magit-mode-map: %S\n" (keymap-lookup magit-mode-map "@")))
 (princ (format "@ in magit-dispatch: %S\n"
                (ignore-errors (plist-get (cdr (transient-get-suffix 'magit-dispatch "@")) :command))))
@@ -30,8 +31,18 @@
   (agent-notes-toggle-view)
   (princ "\n===== SIDE BY SIDE =====\n")
   (princ (buffer-substring-no-properties (point-min) (point-max)))
-  (princ (format "\nkeys: ? -> %S, v -> %S, M-n -> %S, n -> %S\n"
-                 (key-binding "?") (key-binding "v") (key-binding (kbd "M-n")) (key-binding "n")))
+  (princ (format "\nkeys: ? -> %S, v -> %S, M-n -> %S, n -> %S, a -> %S, # -> %S, RET -> %S\n"
+                 (key-binding "?") (key-binding "v") (key-binding (kbd "M-n")) (key-binding "n")
+                 (key-binding "a") (key-binding "#") (key-binding (kbd "RET"))))
+  (agent-notes-toggle-line-numbers)
+  (princ "\n===== SIDE BY SIDE, NO LINE NUMBERS =====\n")
+  (princ (buffer-substring-no-properties (point-min) (point-max)))
+  (agent-notes-toggle-line-numbers)
+  (goto-char (point-min))
+  (when (search-forward "+def median(xs)" nil t)
+    (princ (format "faces on +def median(xs): %S\n"
+                   (delete-dups (mapcar (lambda (p) (get-text-property p 'font-lock-face))
+                                        (number-sequence (match-beginning 0) (1- (point))))))))
 
   ;; Simulate an agent run that edits the file.
   (let* ((file (expand-file-name "stats.py" default-directory))
@@ -70,4 +81,8 @@
   (let ((w agent-notes--width))
     (setq agent-notes--width 1)
     (agent-notes--on-window-size-change (selected-window))
-    (princ (format "width re-render: %S -> %S\n" w agent-notes--width))))
+    (princ (format "width re-render: %S -> %S\n" w agent-notes--width)))
+  (agent-notes-show-log)
+  (princ "\n===== LOG =====\n")
+  (princ (with-current-buffer (agent-notes--log-buffer-name)
+           (buffer-substring-no-properties (point-min) (point-max)))))
