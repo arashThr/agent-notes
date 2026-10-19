@@ -5,7 +5,7 @@
 ;; repo with uncommitted changes (the agent WILL edit its files):
 ;;   emacs -Q --batch \
 ;;     --eval '(progn (setq package-user-dir "~/.config/emacs/elpa") (package-initialize))' \
-;;     -L . --eval '(setq default-directory "/path/to/repo/")' -l ./e2e.el
+;;     -L . --eval '(setq default-directory "/path/to/repo/")' -l test/e2e.el
 
 (require 'agent-notes)
 

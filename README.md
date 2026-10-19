@@ -209,18 +209,22 @@ The code is split by concern. Each file requires the ones above it:
 | `agent-notes-magit.el`  | `@` in Magit and `magit-dispatch`, and the status section; loaded once Magit is loaded                           |
 | `agent-notes.el`        | The mode, keymap, commands, menus and entry points                                                               |
 
-Tests:
+The checks live in `test/`. Run the tests from the repository root:
 
 ```sh
 emacs -Q --batch \
   --eval '(progn (setq package-user-dir "~/.config/emacs/elpa") (package-initialize))' \
-  -L . -l agent-notes-tests.el -f ert-run-tests-batch-and-exit
+  -L . -l test/agent-notes-tests.el -f ert-run-tests-batch-and-exit
 ```
 
-Use the same Emacs that compiled your packages. On this machine that is `/Applications/Emacs.app/Contents/MacOS/Emacs` (31.1); the `emacs` on `PATH` is 30.2 and prints harmless transient warnings.
+Set `package-user-dir` to where your Magit and transient are installed, and use the same Emacs that compiled them.
 
-- `agent-notes-tests.el` also runs the whole request cycle against fake `copilot`, `claude` and `codex` scripts, in a scratch git repository, and checks every diff source. It needs no real agent requests.
-- `integ.el` checks the Magit integration and simulated agent edits, without any Copilot requests.
-- `e2e.el` runs a real Overview task and a code-change request against Copilot. It uses 2 requests.
+- `test/agent-notes-tests.el` also runs the whole request cycle against fake `copilot`, `claude` and `codex` scripts, in a scratch git repository, and checks every diff source. It needs no real agent requests.
+- `test/integ.el` checks the Magit integration and simulated agent edits, without any Copilot requests.
+- `test/e2e.el` runs a real Overview task and a code-change request against Copilot. It uses 2 requests.
 
 See the comments at the top of each file.
+
+## License
+
+GPL-3.0-or-later. See [`LICENSE`](LICENSE).

@@ -3,6 +3,7 @@
 ;; Version: 0.4.0
 ;; Package-Requires: ((emacs "29.1") (magit-section "4.0") (transient "0.7"))
 ;; Keywords: tools, vc, convenience
+;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;; This file is not part of GNU Emacs.
 

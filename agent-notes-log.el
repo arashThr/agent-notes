@@ -1,5 +1,7 @@
 ;;; agent-notes-log.el --- A readable log of what happens in a review -*- lexical-binding: t; -*-
 
+;; SPDX-License-Identifier: GPL-3.0-or-later
+
 ;; This file is not part of GNU Emacs.
 
 ;;; Commentary:

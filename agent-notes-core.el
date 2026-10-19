@@ -1,5 +1,7 @@
 ;;; agent-notes-core.el --- Options, faces, state and storage for agent-notes -*- lexical-binding: t; -*-
 
+;; SPDX-License-Identifier: GPL-3.0-or-later
+
 ;; This file is not part of GNU Emacs.
 
 ;;; Commentary:

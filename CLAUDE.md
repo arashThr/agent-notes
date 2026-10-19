@@ -16,18 +16,22 @@ user-facing description and key bindings.
 
 Load order follows the dependencies (each file requires the ones above it):
 
-| File | Responsibility |
-|---|---|
-| `agent-notes-core.el` | Options, faces, buffer-local state, agent registry (`agent-notes-agents`), JSON storage, review-data helpers, scope labels |
-| `agent-notes-diff.el` | Running git, building diffs per scope (worktree, staged, branch, commit, range), parsing hunks, anchoring notes to lines, edit fingerprints |
-| `agent-notes-render.el` | Drawing the review buffer with `magit-section`: unified and side-by-side diffs, note boxes, syntax highlighting |
-| `agent-notes-log.el` | The human-readable activity log buffer |
-| `agent-notes-agent.el` | Prompts, building CLI arguments per agent, running the process, parsing answers, applying suggestions, detecting agent edits |
-| `agent-notes-magit.el` | Magit integration (optional; loaded from Magit buffers) |
-| `agent-notes.el` | Entry point: major mode, commands, key maps, transient menus |
-| `agent-notes-tests.el` | ERT tests |
-| `integ.el` | Batch integration check with Magit against a scratch repo (no agent requests) |
-| `e2e.el` | Manual end-to-end check against the real Copilot CLI (costs requests) |
+| File                        | Responsibility                                                                                                                              |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `agent-notes-core.el`       | Options, faces, buffer-local state, agent registry (`agent-notes-agents`), JSON storage, review-data helpers, scope labels                  |
+| `agent-notes-diff.el`       | Running git, building diffs per scope (worktree, staged, branch, commit, range), parsing hunks, anchoring notes to lines, edit fingerprints |
+| `agent-notes-render.el`     | Drawing the review buffer with `magit-section`: unified and side-by-side diffs, note boxes, syntax highlighting                             |
+| `agent-notes-log.el`        | The human-readable activity log buffer                                                                                                      |
+| `agent-notes-agent.el`      | Prompts, building CLI arguments per agent, running the process, parsing answers, applying suggestions, detecting agent edits                |
+| `agent-notes-magit.el`      | Magit integration (optional; loaded from Magit buffers)                                                                                     |
+| `agent-notes.el`            | Entry point: major mode, commands, key maps, transient menus                                                                                |
+| `test/agent-notes-tests.el` | ERT tests                                                                                                                                   |
+| `test/integ.el`             | Batch integration check with Magit against a scratch repo (no agent requests)                                                               |
+| `test/e2e.el`               | Manual end-to-end check against the real Copilot CLI (costs requests)                                                                       |
+
+The package files stay at the root so a clone works with `:load-path` or
+`package-vc-install`; everything else that is not part of the package goes
+in `test/`.
 
 Reviews are stored per repository in `.git/agent-notes/` as `ID.json` plus an
 `ID.diff` snapshot. They are local and never pushed.
@@ -41,21 +45,21 @@ come from `~/.config/emacs/elpa`.
 Tests:
 
 ```sh
-/Applications/Emacs.app/Contents/MacOS/Emacs -Q --batch --eval '(progn (setq package-user-dir (expand-file-name "~/.config/emacs/elpa")) (package-initialize))' -L . -l agent-notes-tests.el -f ert-run-tests-batch-and-exit
+/Applications/Emacs.app/Contents/MacOS/Emacs -Q --batch --eval '(progn (setq package-user-dir (expand-file-name "~/.config/emacs/elpa")) (package-initialize))' -L . -l test/agent-notes-tests.el -f ert-run-tests-batch-and-exit
 ```
 
 Strict compile (warnings are errors), then remove the `.elc` files so they
 don't shadow the sources:
 
 ```sh
-/Applications/Emacs.app/Contents/MacOS/Emacs -Q --batch --eval '(progn (setq package-user-dir (expand-file-name "~/.config/emacs/elpa")) (package-initialize))' --eval "(setq byte-compile-error-on-warn t)" -L . -f batch-byte-compile agent-notes-core.el agent-notes-diff.el agent-notes-render.el agent-notes-log.el agent-notes-agent.el agent-notes-magit.el agent-notes.el agent-notes-tests.el && echo COMPILE-OK; rm -f *.elc
+/Applications/Emacs.app/Contents/MacOS/Emacs -Q --batch --eval '(progn (setq package-user-dir (expand-file-name "~/.config/emacs/elpa")) (package-initialize))' --eval "(setq byte-compile-error-on-warn t)" -L . -f batch-byte-compile agent-notes-core.el agent-notes-diff.el agent-notes-render.el agent-notes-log.el agent-notes-agent.el agent-notes-magit.el agent-notes.el test/agent-notes-tests.el && echo COMPILE-OK; rm -f *.elc test/*.elc
 ```
 
 Integration (needs a scratch repo with uncommitted changes to `stats.py` and at
 least one review, e.g. `/tmp/an-demo4/`):
 
 ```sh
-/Applications/Emacs.app/Contents/MacOS/Emacs -Q --batch --eval '(progn (setq package-user-dir (expand-file-name "~/.config/emacs/elpa")) (package-initialize))' -L . --eval '(setq default-directory "/tmp/an-demo4/")' -l ./integ.el
+/Applications/Emacs.app/Contents/MacOS/Emacs -Q --batch --eval '(progn (setq package-user-dir (expand-file-name "~/.config/emacs/elpa")) (package-initialize))' -L . --eval '(setq default-directory "/tmp/an-demo4/")' -l test/integ.el
 ```
 
 ## Working rules
@@ -64,7 +68,7 @@ least one review, e.g. `/tmp/an-demo4/`):
   for new behaviour.
 - Keep `README.md` in sync with user-visible changes (commands, keys, options).
 - Commit only when the user asks.
-- Real agent runs cost the user requests. Ask before running `e2e.el` or any
+- Real agent runs cost the user requests. Ask before running `test/e2e.el` or any
   real Copilot, Claude Code or Codex call; tests use fake scripts instead.
 - Keep changes focused and in the style of the surrounding code. Answers to
   the user should be concise.

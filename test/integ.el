@@ -2,7 +2,7 @@
 ;; Needs a scratch repo with uncommitted changes to stats.py and at least one
 ;; review; it edits stats.py temporarily and restores it.  Usage:
 ;;   emacs -Q --batch --eval '(progn (setq package-user-dir "~/.config/emacs/elpa") (package-initialize))' \
-;;     -L . --eval '(setq default-directory "/path/to/repo/")' -l ./integ.el
+;;     -L . --eval '(setq default-directory "/path/to/repo/")' -l test/integ.el
 
 (require 'magit)
 (require 'agent-notes)

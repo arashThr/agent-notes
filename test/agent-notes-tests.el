@@ -5,7 +5,7 @@
 ;; Run with (magit-section and transient must be on the load path):
 ;;   emacs -Q --batch \
 ;;     --eval '(progn (setq package-user-dir "~/.config/emacs/elpa") (package-initialize))' \
-;;     -L . -l agent-notes-tests.el -f ert-run-tests-batch-and-exit
+;;     -L . -l test/agent-notes-tests.el -f ert-run-tests-batch-and-exit
 
 ;;; Code:
 
