@@ -1,40 +1,48 @@
 ;;; agent-notes.el --- Review git changes with an AI agent using inline notes -*- lexical-binding: t; -*-
 
-;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1"))
+;; Version: 0.2.0
+;; Package-Requires: ((emacs "29.1") (magit-section "4.0") (transient "0.7"))
 ;; Keywords: tools, vc, convenience
 
 ;; This file is not part of GNU Emacs.
 
 ;;; Commentary:
 
-;; Agent Notes lets you review the changes in a git repository together
-;; with an AI agent (GitHub Copilot CLI), using notes attached to lines
-;; of a read-only diff.
+;; Agent Notes lets you go through the changes in a git repository
+;; together with an AI agent (GitHub Copilot CLI), using notes attached
+;; to lines of a read-only diff.
 ;;
 ;; - M-x agent-notes-review   Snapshot the working tree (or the current
-;;                            branch vs. a base branch) and ask the agent
-;;                            to review it.  The agent's notes appear
-;;                            inline, under the lines they refer to.
+;;                            branch vs. a base branch) and give the
+;;                            agent a task: a bug review, an overview of
+;;                            the important changes, or your own
+;;                            instructions.  Its notes appear inline.
 ;; - M-x agent-notes-open     Reopen a previous review.
+;; - M-x agent-notes-menu     All of the above in a menu.  In Magit it is
+;;                            on `@', and in `magit-dispatch'.
 ;;
-;; In the review buffer you can navigate between notes, add your own
-;; notes, reply to the agent, edit or delete your unsent comments and
-;; resolve threads.  Your comments are queued; press `s' to send all of
-;; them to the agent in one go.  The agent answers in the same Copilot
-;; session, so it remembers the review.
+;; The review buffer is built on `magit-section': files, hunks and
+;; notes fold with TAB, and the diff can be shown unified or side by
+;; side (`v').  You can navigate between notes, add your own notes,
+;; reply to the agent, edit or delete your unsent comments and resolve
+;; threads.  Your comments are queued; press `s' to send all of them to
+;; the agent in one go.  The agent answers in the same Copilot session,
+;; so it remembers the review.  When you ask it to change code, it
+;; edits the files and the diff is refreshed, with the notes moving
+;; along with the code.  Press `?' for all commands.
 ;;
-;; The agent runs with read-only permissions and returns its notes as
-;; JSON; only Emacs writes the review files, which live in
-;; .git/agent-notes/ (never committed).
+;; Reviews live in .git/agent-notes/ and are never committed.
 
 ;;; Code:
 
 (require 'cl-lib)
+(require 'eieio)
 (require 'subr-x)
 (require 'diff-mode)
 (require 'json)
 (require 'text-property-search)
+(require 'magit-section)
+(require 'transient)
 
 ;;;; Customization
 
@@ -52,19 +60,35 @@
 For example \\='(\"--model\" \"gpt-5\")."
   :type '(repeat string))
 
+(defcustom agent-notes-allow-edits t
+  "When non-nil, the agent may edit files in the repository.
+It is told to change code only when you ask for it in a comment.
+After each request the diff is checked for changes; see
+`agent-notes-auto-refresh'.  When nil, file writes are denied and
+the agent describes changes instead of making them."
+  :type 'boolean)
+
 (defcustom agent-notes-allowed-tools
   '("shell(git diff)" "shell(git log)" "shell(git show)" "shell(git blame)"
     "shell(git status)" "shell(git grep)" "shell(git ls-files)"
     "shell(rg)" "shell(grep)" "shell(ls)" "shell(cat)" "shell(head)"
     "shell(tail)" "shell(wc)")
   "Copilot permission patterns the agent may use without asking.
-Each entry is passed as --allow-tool.  Keep these read-only."
+Each entry is passed as --allow-tool.  File writes are controlled
+separately by `agent-notes-allow-edits'."
   :type '(repeat string))
 
-(defcustom agent-notes-denied-tools '("write")
+(defcustom agent-notes-denied-tools nil
   "Copilot permission patterns the agent is never allowed to use.
-Each entry is passed as --deny-tool."
+Each entry is passed as --deny-tool.  \"write\" is added or removed
+according to `agent-notes-allow-edits'."
   :type '(repeat string))
+
+(defcustom agent-notes-auto-refresh t
+  "When non-nil, refresh the diff after the agent changes files.
+The notes are moved to the lines that now hold their code.  When
+nil, only report the changes; refresh with \\[agent-notes-refresh]."
+  :type 'boolean)
 
 (defcustom agent-notes-base-branch nil
   "Default base branch for branch reviews.
@@ -75,9 +99,44 @@ When nil, use origin/HEAD, then main or master."
   "When non-nil, branch reviews also include uncommitted changes."
   :type 'boolean)
 
-(defcustom agent-notes-review-instructions nil
-  "Extra instructions appended to the review prompt, or nil."
+(defcustom agent-notes-default-view 'unified
+  "How the diff is shown in new review buffers."
+  :type '(choice (const :tag "Unified" unified)
+                 (const :tag "Side by side" split)))
+
+(defcustom agent-notes-tasks
+  '(("Review" . "You are a meticulous senior engineer reviewing these changes. \
+Look for bugs, incorrect logic, unhandled edge cases, security problems, \
+poor error handling, performance issues, unclear code and missing tests. \
+Prefer a few high-signal notes over many trivial ones, and do not leave \
+notes that only praise.  In the summary, give your overall assessment in \
+two or three sentences.")
+    ("Overview" . "Help the user understand these changes quickly.  Focus \
+only on the most important parts; skip boilerplate, formatting, renames and \
+other mechanical edits.  In the summary, explain what changed and why, in \
+the order the user should read it (a short paragraph or a few bullet \
+points).  Then leave about 3 to 8 notes with severity \"info\" on the key \
+lines, each explaining what that part does and how it fits into the whole.  \
+Do not hunt for bugs, but mention anything that is clearly broken."))
+  "Tasks you can give the agent, as an alist of (NAME . INSTRUCTIONS).
+When starting a review or pressing \\<agent-notes-mode-map>\\[agent-notes-request-review], you choose a task by
+NAME, or type your own instructions instead.  The agent always
+receives the context of the review (repository, scope, diff) and
+the format for notes; INSTRUCTIONS say what to do with them."
+  :type '(alist :key-type (string :tag "Name")
+                :value-type (string :tag "Instructions")))
+
+(define-obsolete-variable-alias 'agent-notes-review-instructions
+  'agent-notes-extra-instructions "0.2.0")
+
+(defcustom agent-notes-extra-instructions nil
+  "Extra instructions added to every task, or nil.
+For example, the conventions of your project."
   :type '(choice (const :tag "None" nil) string))
+
+(defcustom agent-notes-magit-status-section t
+  "When non-nil, show the latest review in the Magit status buffer."
+  :type 'boolean)
 
 (defcustom agent-notes-directory-name "agent-notes"
   "Name of the directory inside the git directory that stores reviews."
@@ -92,7 +151,7 @@ When nil, use origin/HEAD, then main or master."
   "Background of note blocks.")
 
 (defface agent-notes-border '((t :inherit shadow))
-  "Face for the frame drawn around notes.")
+  "Face for the frame drawn around notes and between diff columns.")
 
 (defface agent-notes-agent '((t :inherit font-lock-keyword-face :weight bold))
   "Face for the agent's name.")
@@ -105,6 +164,9 @@ When nil, use origin/HEAD, then main or master."
 
 (defface agent-notes-resolved '((t :inherit shadow))
   "Face for resolved notes.")
+
+(defface agent-notes-info '((t :inherit font-lock-function-name-face))
+  "Face for the severity \"info\", used for explanations.")
 
 (defface agent-notes-code '((t :inherit font-lock-constant-face))
   "Face for inline code in notes.")
@@ -121,13 +183,19 @@ When nil, use origin/HEAD, then main or master."
 (defface agent-notes-line-number '((t :inherit line-number))
   "Face for line numbers in the diff gutter.")
 
+(defface agent-notes-added '((t :inherit diff-added))
+  "Face for added lines.")
+
+(defface agent-notes-removed '((t :inherit diff-removed))
+  "Face for removed lines.")
+
+(defface agent-notes-context '((t :inherit diff-context))
+  "Face for unchanged lines.")
+
 ;;;; Internal state
 
 (defconst agent-notes--empty-tree "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
   "Git's empty tree, used as the base when the repository has no commits.")
-
-(defconst agent-notes--pad (make-string 12 ?\s)
-  "Indentation of notes; matches the width of the line-number gutter.")
 
 (defconst agent-notes--log-buffer "*agent-notes-log*")
 
@@ -136,10 +204,20 @@ When nil, use origin/HEAD, then main or master."
 (defvar-local agent-notes--records nil "Parsed diff line records.")
 (defvar-local agent-notes--index nil "Map from location key to diff record.")
 (defvar-local agent-notes--placement nil "Map from note id to the record it is shown under.")
-(defvar-local agent-notes--folded nil "Map from note id to explicit fold state.")
 (defvar-local agent-notes--process nil "Running Copilot process, if any.")
 (defvar-local agent-notes--status nil "What the agent is doing, or nil when idle.")
 (defvar-local agent-notes--in-flight nil "Ids of comments currently being sent.")
+(defvar-local agent-notes--changes nil "Files the agent changed in its last request.")
+(defvar-local agent-notes--view 'unified "Either `unified' or `split' (side by side).")
+(defvar-local agent-notes--width nil "Window width the buffer was last rendered for.")
+(defvar-local agent-notes--half 80 "Width of each column in the side-by-side view.")
+(defvar-local agent-notes--gutter 5 "Width of the line-number gutter in the side-by-side view.")
+(defvar-local agent-notes--pad (make-string 12 ?\s) "Indentation of notes.")
+
+(defvar agent-notes--task-history nil "History of tasks given to the agent.")
+
+;; Introduced in magit-section 4.3.6.
+(defvar magit-section-highlight-current)
 
 ;;;; Git
 
@@ -187,10 +265,13 @@ When nil, use origin/HEAD, then main or master."
     (unless top (user-error "Not inside a git repository"))
     (file-name-as-directory top)))
 
+(declare-function magit-gitdir "magit-git" (&optional directory common))
+
 (defun agent-notes--directory ()
   "Return the directory that stores reviews for the current repository."
   (expand-file-name agent-notes-directory-name
-                    (or (agent-notes--git-try "rev-parse" "--absolute-git-dir")
+                    (or (and (fboundp 'magit-gitdir) (ignore-errors (magit-gitdir)))
+                        (agent-notes--git-try "rev-parse" "--absolute-git-dir")
                         (user-error "Not inside a git repository"))))
 
 (defun agent-notes--default-base ()
@@ -224,6 +305,11 @@ When nil, use origin/HEAD, then main or master."
                  (agent-notes--git-diff mb "HEAD"))
                base mb head)))
       (_ (error "Unknown scope %S" scope)))))
+
+(defun agent-notes--snapshot-diff (review)
+  "Return (DIFF BASE-LABEL BASE-REV HEAD-REV) for the scope of REVIEW, now."
+  (let ((default-directory (plist-get review :root)))
+    (agent-notes--make-diff (plist-get review :scope) (plist-get review :base))))
 
 ;;;; Diff parsing
 
@@ -264,8 +350,8 @@ When nil, use origin/HEAD, then main or master."
 (defun agent-notes--parse-diff (diff)
   "Parse the unified DIFF text into a list of line records.
 Each record is a plist with :kind (`file', `hunk', `context',
-`added', `removed' or `meta'), :text, :path and, for code lines,
-:old and :new line numbers."
+`added', `removed' or `meta'), :text, :path and, for code lines
+and hunks, :old and :new line numbers."
   (let (records file in-hunk (old 0) (new 0))
     (dolist (line (split-string diff "\n"))
       (cond
@@ -279,7 +365,8 @@ Each record is a plist with :kind (`file', `hunk', `context',
         (setq in-hunk t
               old (string-to-number (match-string 1 line))
               new (string-to-number (match-string 2 line)))
-        (push (list :kind 'hunk :text line :path (plist-get file :path)) records))
+        (push (list :kind 'hunk :text line :path (plist-get file :path) :old old :new new)
+              records))
        ((and in-hunk (> (length line) 0) (memq (aref line 0) '(?\s ?+ ?- ?\\)))
         (let ((path (plist-get file :path)))
           (pcase (aref line 0)
@@ -293,6 +380,26 @@ Each record is a plist with :kind (`file', `hunk', `context',
        ((and file (not in-hunk))
         (agent-notes--parse-file-meta file line))))
     (nreverse records)))
+
+(defun agent-notes--code-p (rec)
+  "Return non-nil if REC is a line of code."
+  (memq (plist-get rec :kind) '(context added removed)))
+
+(defun agent-notes--content (rec)
+  "Return the code of the line REC, without the diff prefix."
+  (substring (plist-get rec :text) 1))
+
+(defun agent-notes--rec-side (rec &optional context-side)
+  "Return the side of REC: \"old\" or \"new\".
+Context lines are on both sides; return CONTEXT-SIDE or \"new\"."
+  (pcase (plist-get rec :kind)
+    ('removed "old")
+    ('added "new")
+    (_ (or context-side "new"))))
+
+(defun agent-notes--rec-line (rec side)
+  "Return the line number of REC on SIDE."
+  (plist-get rec (if (equal side "old") :old :new)))
 
 (defun agent-notes--loc-key (path side line)
   "Return the index key for LINE on SIDE of PATH."
@@ -311,6 +418,30 @@ Each record is a plist with :kind (`file', `hunk', `context',
           ('removed (puthash (agent-notes--loc-key path "old" (plist-get rec :old)) rec index)))))
     index))
 
+(defun agent-notes--file-tree (records)
+  "Group RECORDS into a list of (FILE-REC . HUNKS).
+Each element of HUNKS is (HUNK-REC . LINE-RECS)."
+  (let (files)
+    (dolist (rec records)
+      (pcase (plist-get rec :kind)
+        ('file (push (list rec) files))
+        ('hunk (when files
+                 (setcdr (car files) (cons (list rec) (cdr (car files))))))
+        (_ (let ((hunk (cadr (car files))))
+             (when hunk (setcdr hunk (cons rec (cdr hunk))))))))
+    (mapcar (lambda (file)
+              (cons (car file)
+                    (mapcar (lambda (hunk) (cons (car hunk) (reverse (cdr hunk))))
+                            (reverse (cdr file)))))
+            (nreverse files))))
+
+(defun agent-notes--fingerprints (diff)
+  "Return an alist (PATH . MD5) with a hash of each file's part of DIFF."
+  (mapcar (lambda (chunk)
+            (let ((chunk (concat "diff --git " chunk)))
+              (cons (plist-get (car (agent-notes--parse-diff chunk)) :path) (md5 chunk))))
+          (split-string diff "^diff --git " t)))
+
 (defun agent-notes--exact-record (note)
   "Return the diff record exactly matching NOTE's location, or nil."
   (gethash (agent-notes--loc-key (plist-get note :path) (plist-get note :side)
@@ -320,23 +451,23 @@ Each record is a plist with :kind (`file', `hunk', `context',
 (defun agent-notes--anchor-record (note)
   "Return the record NOTE should be displayed under, or nil.
 Falls back to the nearest line of the same file, then to the file
-header."
+header.  Notes without a file are not anchored."
   (let ((path (plist-get note :path))
         (key (if (equal (plist-get note :side) "old") :old :new))
         (line (plist-get note :line)))
-    (or (agent-notes--exact-record note)
-        (let (best best-dist)
-          (dolist (rec agent-notes--records)
-            (let ((l (plist-get rec key)))
-              (when (and l (equal (plist-get rec :path) path)
-                         (memq (plist-get rec :kind) '(context added removed)))
-                (let ((dist (abs (- l line))))
-                  (when (or (null best) (< dist best-dist))
-                    (setq best rec best-dist dist))))))
-          best)
-        (cl-find-if (lambda (rec) (and (eq (plist-get rec :kind) 'file)
-                                       (equal (plist-get rec :path) path)))
-                    agent-notes--records))))
+    (and (not (string-empty-p path))
+         (or (agent-notes--exact-record note)
+             (let (best best-dist)
+               (dolist (rec agent-notes--records)
+                 (let ((l (plist-get rec key)))
+                   (when (and l (equal (plist-get rec :path) path) (agent-notes--code-p rec))
+                     (let ((dist (abs (- l line))))
+                       (when (or (null best) (< dist best-dist))
+                         (setq best rec best-dist dist))))))
+               best)
+             (cl-find-if (lambda (rec) (and (eq (plist-get rec :kind) 'file)
+                                            (equal (plist-get rec :path) path)))
+                         agent-notes--records)))))
 
 ;;;; Storage
 
@@ -361,18 +492,45 @@ header."
   "Return the diff snapshot file belonging to the review FILE."
   (concat (file-name-sans-extension file) ".diff"))
 
+(defun agent-notes--compact (plist)
+  "Return a copy of PLIST without nil values, which JSON cannot represent."
+  (let (out)
+    (while plist
+      (when (cadr plist)
+        (setq out (cons (cadr plist) (cons (car plist) out))))
+      (setq plist (cddr plist)))
+    (nreverse out)))
+
 (defun agent-notes--serialize (review)
   "Return REVIEW as pretty-printed JSON."
-  (let ((data (plist-put
-               (copy-sequence review) :notes
-               (vconcat (mapcar (lambda (note)
-                                  (plist-put (copy-sequence note) :comments
-                                             (vconcat (plist-get note :comments))))
-                                (plist-get review :notes))))))
+  (let ((data (copy-sequence review)))
+    (setq data (plist-put
+                data :notes
+                (vconcat (mapcar (lambda (note)
+                                   (agent-notes--compact
+                                    (plist-put (copy-sequence note) :comments
+                                               (vconcat (mapcar #'agent-notes--compact
+                                                                (plist-get note :comments))))))
+                                 (plist-get review :notes)))))
+    (setq data (plist-put data :summaries
+                          (vconcat (mapcar #'agent-notes--compact
+                                           (plist-get review :summaries)))))
     (with-temp-buffer
-      (insert (json-serialize data))
+      (insert (json-serialize (agent-notes--compact data)))
       (json-pretty-print-buffer)
       (buffer-string))))
+
+(defun agent-notes--migrate (review)
+  "Update REVIEW, as read from disk, to the current format."
+  (let ((summary (plist-get review :summary)))
+    (when (and (stringp summary) (not (string-empty-p summary))
+               (null (plist-get review :summaries)))
+      (setq review (plist-put review :summaries
+                              (list (list :task "Review" :text summary
+                                          :time (or (plist-get review :created) ""))))))
+    (if (plist-member review :summary)
+        (plist-put review :summary nil)
+      review)))
 
 (defun agent-notes--save ()
   "Save the review of the current buffer."
@@ -417,14 +575,22 @@ header."
         :state state :time (agent-notes--now)))
 
 (defun agent-notes--add-note (author path side line severity body state)
-  "Add a note by AUTHOR at LINE on SIDE of PATH and return it."
-  (let ((note (list :id (agent-notes--next :next_note) :author author :path path
-                    :side side :line line :severity severity :status "open"
-                    :comments (list (agent-notes--make-comment author body state)))))
+  "Add a note by AUTHOR at LINE on SIDE of PATH and return it.
+An empty PATH makes a general note about the whole change."
+  (let* ((note (list :id (agent-notes--next :next_note) :author author :path path
+                     :side side :line line :severity severity :status "open"
+                     :comments (list (agent-notes--make-comment author body state))))
+         (rec (agent-notes--exact-record note)))
+    ;; Remember the code, so the note can follow it when the diff changes.
+    (when rec (setq note (plist-put note :text (agent-notes--content rec))))
     (setq agent-notes--review
           (plist-put agent-notes--review :notes
                      (append (agent-notes--notes) (list note))))
     note))
+
+(defun agent-notes--general-p (note)
+  "Return non-nil if NOTE is about the whole change, not a file."
+  (string-empty-p (plist-get note :path)))
 
 (defun agent-notes--resolved-p (note)
   "Return non-nil if NOTE is resolved."
@@ -465,6 +631,18 @@ header."
         (substring p (match-end 0))
       p)))
 
+(defun agent-notes--location (note)
+  "Return a short description of where NOTE is."
+  (if (agent-notes--general-p note)
+      "general"
+    (format "%s:%s" (plist-get note :path) (plist-get note :line))))
+
+(defun agent-notes--first-line (note width)
+  "Return the first line of NOTE's first comment, truncated to WIDTH."
+  (truncate-string-to-width
+   (car (split-string (plist-get (car (plist-get note :comments)) :body) "\n"))
+   width nil nil "…"))
+
 (defun agent-notes--scope-label (review)
   "Return a short description of REVIEW's scope."
   (if (equal (plist-get review :scope) "branch")
@@ -475,6 +653,60 @@ header."
   "Return the name of REVIEW's repository."
   (file-name-nondirectory (directory-file-name (plist-get review :root))))
 
+;;;; Following the code when the diff changes
+
+(defun agent-notes--reanchor (note)
+  "Move NOTE to the line that now holds its code.
+Return non-nil if the note moved.  When its code is no longer in
+the diff, mark the note as outdated."
+  (let ((text (plist-get note :text)))
+    (when (and (stringp text) (not (agent-notes--general-p note)))
+      (let ((exact (agent-notes--exact-record note)))
+        (if (and exact (equal (agent-notes--content exact) text))
+            (progn (plist-put note :outdated nil) nil)
+          (let ((path (plist-get note :path))
+                (side (plist-get note :side))
+                (line (plist-get note :line))
+                best best-dist)
+            (dolist (rec agent-notes--records)
+              (when (and (agent-notes--code-p rec)
+                         (equal (plist-get rec :path) path)
+                         (equal (agent-notes--content rec) text))
+                (let* ((s (agent-notes--rec-side rec side))
+                       (l (agent-notes--rec-line rec s))
+                       (dist (abs (- l line))))
+                  (when (or (null best) (< dist best-dist))
+                    (setq best (cons s l) best-dist dist)))))
+            (if (not best)
+                (progn (plist-put note :outdated t) nil)
+              (plist-put note :side (car best))
+              (plist-put note :line (cdr best))
+              (plist-put note :outdated nil)
+              t)))))))
+
+(defun agent-notes--set-diff (diff)
+  "Use DIFF as the diff of the current review."
+  (setq agent-notes--records (agent-notes--parse-diff diff)
+        agent-notes--index (agent-notes--index-records agent-notes--records)))
+
+(defun agent-notes--resnapshot (&optional snapshot)
+  "Replace the review's diff with SNAPSHOT, or with the current changes.
+SNAPSHOT is a list (DIFF BASE-LABEL BASE-REV HEAD-REV).  Move the
+notes along with their code and save.  Return (MOVED . OUTDATED)."
+  (pcase-let ((`(,diff ,_label ,base-rev ,head)
+               (or snapshot (agent-notes--snapshot-diff agent-notes--review)))
+              (moved 0)
+              (outdated 0))
+    (agent-notes--write-file (agent-notes--diff-file agent-notes--file) diff)
+    (setq agent-notes--review (plist-put agent-notes--review :base_rev base-rev))
+    (setq agent-notes--review (plist-put agent-notes--review :head_rev head))
+    (agent-notes--set-diff diff)
+    (dolist (note (agent-notes--notes))
+      (when (agent-notes--reanchor note) (cl-incf moved))
+      (when (plist-get note :outdated) (cl-incf outdated)))
+    (agent-notes--save)
+    (cons moved outdated)))
+
 ;;;; Rendering
 
 (defun agent-notes--severity-face (severity)
@@ -483,6 +715,7 @@ header."
     ((or "issue" "bug" "error" "critical") 'error)
     ("warning" 'warning)
     ("question" 'font-lock-builtin-face)
+    ("info" 'agent-notes-info)
     ("nit" 'shadow)
     (_ 'success)))
 
@@ -490,38 +723,52 @@ header."
   "Return the face for AUTHOR."
   (if (equal author "agent") 'agent-notes-agent 'agent-notes-you))
 
-(defun agent-notes--collapsed-p (note)
-  "Return non-nil if NOTE is folded.  Resolved notes are folded by default."
-  (let ((state (gethash (plist-get note :id) agent-notes--folded 'unset)))
-    (if (eq state 'unset) (agent-notes--resolved-p note) state)))
+(defun agent-notes--line-face (kind)
+  "Return the face for diff lines of KIND."
+  (pcase kind
+    ('added 'agent-notes-added)
+    ('removed 'agent-notes-removed)
+    (_ 'agent-notes-context)))
 
-(defun agent-notes--fontify-line (line in-fence base)
+(defun agent-notes--fontify-line (line in-fence base &optional plain)
   "Return LINE of Markdown with faces; IN-FENCE means inside a code block.
-BASE is the face for ordinary text."
-  (if (or in-fence (string-prefix-p "```" (string-trim-left line)))
-      (propertize line 'font-lock-face (list 'agent-notes-code base 'agent-notes-note))
-    (let ((s (propertize line 'font-lock-face (list base 'agent-notes-note)))
-          (start 0))
-      (while (string-match "`[^`]+`\\|\\*\\*[^*]+\\*\\*" s start)
-        (put-text-property (match-beginning 0) (match-end 0) 'font-lock-face
-                           (list (if (eq (aref s (match-beginning 0)) ?`)
-                                     'agent-notes-code
-                                   'bold)
-                                 base 'agent-notes-note)
-                           s)
-        (setq start (match-end 0)))
-      s)))
+BASE is the face for ordinary text.  Unless PLAIN, add the note
+background."
+  (let ((bg (unless plain '(agent-notes-note))))
+    (if (or in-fence (string-prefix-p "```" (string-trim-left line)))
+        (propertize line 'font-lock-face (append (list 'agent-notes-code base) bg))
+      (let ((s (propertize line 'font-lock-face (cons base bg)))
+            (start 0))
+        (while (string-match "`[^`]+`\\|\\*\\*[^*]+\\*\\*" s start)
+          (put-text-property (match-beginning 0) (match-end 0) 'font-lock-face
+                             (append (list (if (eq (aref s (match-beginning 0)) ?`)
+                                               'agent-notes-code
+                                             'bold)
+                                           base)
+                                     bg)
+                             s)
+          (setq start (match-end 0)))
+        s))))
+
+(defun agent-notes--insert-markdown (text base pad &optional plain)
+  "Insert TEXT, prefixed with PAD on each line, with Markdown faces.
+BASE and PLAIN are as in `agent-notes--fontify-line'."
+  (let ((in-fence nil))
+    (dolist (line (split-string text "\n"))
+      (insert pad (agent-notes--fontify-line line in-fence base plain) "\n")
+      (when (string-prefix-p "```" (string-trim-left line))
+        (setq in-fence (not in-fence))))))
 
 (defun agent-notes--insert-note (note)
-  "Insert NOTE as a block of text at point."
+  "Insert NOTE as a section at point."
   (let* ((id (plist-get note :id))
-         (start (point))
          (comments (plist-get note :comments))
          (resolved (agent-notes--resolved-p note))
-         (collapsed (agent-notes--collapsed-p note))
          (base (if resolved 'agent-notes-resolved 'default))
          (severity (or (plist-get note :severity) ""))
-         (unsent (cl-count-if #'agent-notes--pending-p comments)))
+         (unsent (cl-count-if #'agent-notes--pending-p comments))
+         (pad agent-notes--pad)
+         (start (point)))
     (cl-flet ((ins (string &rest faces)
                 (insert (propertize string 'font-lock-face
                                     (append faces '(agent-notes-note)))))
@@ -529,132 +776,226 @@ BASE is the face for ordinary text."
                 (cond ((memq (plist-get comment :id) agent-notes--in-flight) "  sending…")
                       ((agent-notes--pending-p comment) "  unsent")
                       (t ""))))
-      ;; Header line.
-      (insert agent-notes--pad)
-      (ins (if collapsed "▸ " "┌ ") 'agent-notes-border)
-      (ins (format "#%d" id) 'bold base)
-      (ins "  ")
-      (ins (plist-get note :author) (agent-notes--author-face (plist-get note :author)))
-      (unless (string-empty-p severity)
+      (magit-insert-section (agent-notes-note id resolved)
+        ;; Heading: one line, also shown when the note is folded.
+        (insert pad)
+        (ins "┌ " 'agent-notes-border)
+        (ins (format "#%d" id) 'bold base)
         (ins "  ")
-        (ins severity (agent-notes--severity-face severity)))
-      (ins "  ")
-      (ins (if resolved "resolved" "open") base)
-      (unless (agent-notes--exact-record note)
-        (ins (format "  %s:%s (not in diff)" (plist-get note :path) (plist-get note :line))
-             'shadow))
-      (when (> unsent 0)
-        (ins (format "  %d unsent" unsent) 'agent-notes-pending))
-      (when collapsed
-        (ins (format "  · %d comment%s · " (length comments)
-                     (if (= (length comments) 1) "" "s"))
-             'shadow)
-        (ins (truncate-string-to-width
-              (car (split-string (plist-get (car comments) :body) "\n"))
-              60 nil nil "…")
-             base))
-      (ins "\n")
-      (put-text-property start (point) 'agent-notes-header id)
-      ;; Comments.
-      (unless collapsed
+        (ins (plist-get note :author) (agent-notes--author-face (plist-get note :author)))
+        (unless (string-empty-p severity)
+          (ins "  ")
+          (ins severity (agent-notes--severity-face severity)))
+        (ins "  ")
+        (ins (if resolved "resolved" "open") base)
+        (cond ((agent-notes--general-p note))
+              ((plist-get note :outdated)
+               (ins "  outdated: the code changed" 'warning))
+              ((not (agent-notes--exact-record note))
+               (ins (format "  %s (not in diff)" (agent-notes--location note)) 'shadow)))
+        (when (> unsent 0)
+          (ins (format "  %d unsent" unsent) 'agent-notes-pending))
+        (when resolved
+          (ins (format "  · %d comment%s · " (length comments)
+                       (if (= (length comments) 1) "" "s"))
+               'shadow)
+          (ins (agent-notes--first-line note 50) base))
+        (ins "\n")
+        (magit-insert-heading)
+        ;; Body: the comments.
         (let ((first t))
           (dolist (comment comments)
             (let ((cstart (point))
-                  (indent (if first "" "  "))
-                  (in-fence nil))
+                  (border (propertize (concat "│ " (if first "" "  "))
+                                      'font-lock-face '(agent-notes-border agent-notes-note))))
               (unless first
-                (insert agent-notes--pad)
+                (insert pad)
                 (ins "│" 'agent-notes-border)
                 (ins "\n")
-                (insert agent-notes--pad)
+                (insert pad)
                 (ins "│ ↳ " 'agent-notes-border)
                 (ins (plist-get comment :author)
                      (agent-notes--author-face (plist-get comment :author)))
                 (ins (state-label comment) 'agent-notes-pending)
                 (ins "\n"))
               (when (and first (memq (plist-get comment :id) agent-notes--in-flight))
-                (insert agent-notes--pad)
+                (insert pad)
                 (ins "│ " 'agent-notes-border)
                 (ins "(sending…)" 'agent-notes-pending)
                 (ins "\n"))
-              (dolist (line (split-string (plist-get comment :body) "\n"))
-                (insert agent-notes--pad)
-                (ins "│ " 'agent-notes-border)
-                (ins indent)
-                (insert (agent-notes--fontify-line line in-fence base))
-                (ins "\n")
-                (when (string-prefix-p "```" (string-trim-left line))
-                  (setq in-fence (not in-fence))))
+              (agent-notes--insert-markdown (plist-get comment :body) base
+                                            (concat pad border))
               (put-text-property cstart (point) 'agent-notes-comment (plist-get comment :id))
               (setq first nil))))
-        (insert agent-notes--pad)
+        (insert pad)
         (ins "└" 'agent-notes-border)
-        (ins "\n"))
-      (put-text-property start (point) 'agent-notes-note id)
-      (put-text-property start (point) 'wrap-prefix
-                         (concat agent-notes--pad
-                                 (propertize "│   " 'face '(agent-notes-border agent-notes-note)))))))
+        (ins "\n")
+        (put-text-property start (point) 'agent-notes-note id)
+        (put-text-property start (point) 'wrap-prefix
+                           (concat pad (propertize "│   " 'face '(agent-notes-border
+                                                                  agent-notes-note))))))))
 
-(defun agent-notes--insert-record (rec)
-  "Insert the diff line record REC at point."
+(defun agent-notes--insert-notes (rec by-record)
+  "Insert the notes anchored to REC, according to BY-RECORD."
+  (when rec
+    (mapc #'agent-notes--insert-note (reverse (gethash rec by-record)))))
+
+(defun agent-notes--insert-line (rec)
+  "Insert the diff line REC in the unified view."
   (let ((start (point))
         (kind (plist-get rec :kind))
         (text (plist-get rec :text)))
-    (pcase kind
-      ('file
-       (insert "\n")
-       (setq start (point))
-       (insert (propertize
-                (concat " " (plist-get rec :path)
-                        (cond ((plist-get rec :from)
-                               (format "  (renamed from %s)" (plist-get rec :from)))
-                              ((equal (plist-get rec :status) "modified") "")
-                              (t (format "  (%s)" (plist-get rec :status))))
-                        "\n")
-                'font-lock-face 'agent-notes-file-header))
-       (put-text-property start (point) 'agent-notes-file (plist-get rec :path)))
-      ('hunk
-       (insert (propertize (concat text "\n") 'font-lock-face 'agent-notes-hunk-header)))
-      ('meta
-       (insert agent-notes--pad (propertize (concat text "\n") 'font-lock-face 'shadow)))
-      (_
-       (insert (propertize (format "%5s %5s " (or (and (not (eq kind 'added)) (plist-get rec :old)) "")
-                                   (or (and (not (eq kind 'removed)) (plist-get rec :new)) ""))
-                           'font-lock-face 'agent-notes-line-number))
-       (insert (propertize (concat text "\n") 'font-lock-face
-                           (pcase kind ('added 'diff-added) ('removed 'diff-removed)
-                                  (_ 'diff-context))))))
+    (if (eq kind 'meta)
+        (insert agent-notes--pad (propertize (concat text "\n") 'font-lock-face 'shadow))
+      (insert (propertize (format "%5s %5s " (or (and (not (eq kind 'added)) (plist-get rec :old)) "")
+                                  (or (and (not (eq kind 'removed)) (plist-get rec :new)) ""))
+                          'font-lock-face 'agent-notes-line-number))
+      (insert (propertize (concat text "\n") 'font-lock-face (agent-notes--line-face kind))))
     (put-text-property start (point) 'agent-notes-loc rec)
     (put-text-property start (point) 'wrap-prefix agent-notes--pad)))
 
+(defun agent-notes--expand-tabs (string)
+  "Return STRING with tabs expanded to spaces."
+  (if (not (string-search "\t" string))
+      string
+    (let ((col 0) (parts nil))
+      (dolist (ch (string-to-list string))
+        (if (eq ch ?\t)
+            (let ((n (- tab-width (% col tab-width))))
+              (push (make-string n ?\s) parts)
+              (cl-incf col n))
+          (push (char-to-string ch) parts)
+          (cl-incf col (char-width ch))))
+      (apply #'concat (nreverse parts)))))
+
+(defun agent-notes--fit (text width)
+  "Return the diff line TEXT expanded and padded or truncated to WIDTH."
+  (truncate-string-to-width
+   (concat (substring text 0 1) (agent-notes--expand-tabs (substring text 1)))
+   width 0 ?\s "…"))
+
+(defun agent-notes--split-rows (lines)
+  "Pair the LINES of a hunk for the side-by-side view.
+Return a list of (LEFT RIGHT).  Context lines are on both sides,
+and each run of removed lines is paired with the added lines that
+follow it.  Other lines, such as \"\\ No newline\", are (:meta REC)."
+  (let (rows removed added)
+    (cl-flet ((flush ()
+                (setq removed (nreverse removed) added (nreverse added))
+                (while (or removed added)
+                  (push (list (pop removed) (pop added)) rows))))
+      (dolist (rec lines)
+        (pcase (plist-get rec :kind)
+          ('removed (when added (flush)) (push rec removed))
+          ('added (push rec added))
+          ('context (flush) (push (list rec rec) rows))
+          (_ (flush) (push (list :meta rec) rows))))
+      (flush))
+    (nreverse rows)))
+
+(defun agent-notes--split-cell (rec key)
+  "Return one half of a side-by-side row for REC, numbered by KEY."
+  (if (null rec)
+      (make-string agent-notes--half ?\s)
+    (concat (propertize (format (format "%%%ds " (1- agent-notes--gutter)) (plist-get rec key))
+                        'font-lock-face 'agent-notes-line-number)
+            (propertize (agent-notes--fit (plist-get rec :text)
+                                          (max 1 (- agent-notes--half agent-notes--gutter)))
+                        'font-lock-face (agent-notes--line-face (plist-get rec :kind))))))
+
+(defun agent-notes--insert-split-row (left right)
+  "Insert a side-by-side row with the records LEFT and RIGHT.
+Each half carries its own record, so commands act on the side at point."
+  (let ((start (point)))
+    (insert (agent-notes--split-cell left :old))
+    (put-text-property start (point) 'agent-notes-loc (or left right))
+    (setq start (point))
+    (insert (propertize "│" 'font-lock-face 'agent-notes-border)
+            (agent-notes--split-cell right :new)
+            "\n")
+    (put-text-property start (point) 'agent-notes-loc (or right left))))
+
+(defun agent-notes--insert-hunk (hunk by-record)
+  "Insert HUNK, a (HUNK-REC . LINES), with the notes from BY-RECORD."
+  (let ((rec (car hunk))
+        (lines (cdr hunk)))
+    (magit-insert-section (agent-notes-hunk (cons (plist-get rec :path) (plist-get rec :text)))
+      (let ((start (point)))
+        (insert (propertize (concat (plist-get rec :text) "\n")
+                            'font-lock-face 'agent-notes-hunk-header))
+        (put-text-property start (point) 'agent-notes-loc rec))
+      (magit-insert-heading)
+      (if (eq agent-notes--view 'split)
+          (dolist (row (agent-notes--split-rows lines))
+            (pcase-let ((`(,left ,right) row))
+              (if (eq left :meta)
+                  (agent-notes--insert-line right)
+                (agent-notes--insert-split-row left right)
+                (agent-notes--insert-notes left by-record)
+                (unless (eq left right)
+                  (agent-notes--insert-notes right by-record)))))
+        (dolist (line lines)
+          (agent-notes--insert-line line)
+          (agent-notes--insert-notes line by-record))))))
+
+(defun agent-notes--insert-file (file by-record)
+  "Insert FILE, a (FILE-REC . HUNKS), with the notes from BY-RECORD."
+  (let ((rec (car file)))
+    (magit-insert-section (agent-notes-file (plist-get rec :path))
+      (let ((start (point)))
+        (insert (propertize
+                 (concat (plist-get rec :path)
+                         (cond ((plist-get rec :from)
+                                (format "  (renamed from %s)" (plist-get rec :from)))
+                               ((equal (plist-get rec :status) "modified") "")
+                               (t (format "  (%s)" (plist-get rec :status))))
+                         "\n")
+                 'font-lock-face 'agent-notes-file-header))
+        (put-text-property start (point) 'agent-notes-loc rec))
+      (magit-insert-heading)
+      (agent-notes--insert-notes rec by-record)
+      (dolist (hunk (cdr file))
+        (agent-notes--insert-hunk hunk by-record)))))
+
 (defun agent-notes--insert-header ()
-  "Insert the title, summary and key hints."
+  "Insert the title, the state of the agent and the summaries."
   (let* ((review agent-notes--review)
-         (summary (or (plist-get review :summary) ""))
-         (base-rev (or (plist-get review :base_rev) ""))
-         (start (point)))
-    (insert (propertize (format "Agent Notes · %s\n" (agent-notes--repo-name review))
-                        'font-lock-face 'agent-notes-title))
-    (insert (propertize (format "%s (%s) · %s\n" (agent-notes--scope-label review)
-                                (substring base-rev 0 (min 10 (length base-rev)))
-                                (plist-get review :created))
-                        'font-lock-face 'shadow))
-    (insert "\n")
-    (cond
-     ((not (string-empty-p summary))
-      (insert (propertize "Summary: " 'font-lock-face 'bold) summary "\n"))
-     (agent-notes--status
-      (insert (propertize "The agent is working; its notes will appear here when it is done.\n"
-                          'font-lock-face 'agent-notes-pending)))
-     ((null (agent-notes--notes))
-      (insert "No notes yet. Press A to ask the agent for a review, "
-              "or c on a line to add your own note.\n")))
-    (insert (propertize
-             (concat "n/p notes  N/P agent notes  {/} files  c new note  r reply  "
-                     "e edit  k delete  R resolve  s send  TAB fold  l list  "
-                     "RET visit  A review again  $ log  ? help\n")
-             'font-lock-face 'shadow))
-    (put-text-property start (point) 'wrap-prefix "  ")))
+         (summaries (plist-get review :summaries))
+         (base-rev (or (plist-get review :base_rev) "")))
+    (magit-insert-section (agent-notes-header)
+      (insert (propertize (format "Agent Notes · %s" (agent-notes--repo-name review))
+                          'font-lock-face 'agent-notes-title)
+              "\n")
+      (magit-insert-heading)
+      (insert (propertize (format "%s (%s) · %s\n" (agent-notes--scope-label review)
+                                  (substring base-rev 0 (min 10 (length base-rev)))
+                                  (plist-get review :created))
+                          'font-lock-face 'shadow))
+      (when agent-notes--status
+        (insert (propertize (format "The agent is working: %s\n" agent-notes--status)
+                            'font-lock-face 'agent-notes-pending)))
+      (when agent-notes--changes
+        (insert (propertize "Changed by the agent: " 'font-lock-face 'bold)
+                (string-join agent-notes--changes ", ") "\n"))
+      (when (and (null summaries) (null (agent-notes--notes)) (not agent-notes--status))
+        (insert "No notes yet.  Press A to give the agent a task, "
+                "or c on a line to write a note.\n"))
+      (dolist (summary summaries)
+        (magit-insert-section (agent-notes-summary (plist-get summary :time))
+          (insert (propertize (format "%s summary" (plist-get summary :task))
+                              'font-lock-face 'bold)
+                  (propertize (format "  %s" (plist-get summary :time)) 'font-lock-face 'shadow)
+                  "\n")
+          (magit-insert-heading)
+          (let ((start (point)))
+            (agent-notes--insert-markdown (plist-get summary :text) 'default "  " t)
+            (put-text-property start (point) 'wrap-prefix "  "))))
+      (insert (propertize (substitute-command-keys
+                           "\\<agent-notes-mode-map>\\[agent-notes-dispatch] all commands  \
+\\[agent-notes-next-note]/\\[agent-notes-previous-note] notes  \\[magit-section-toggle] fold  \
+\\[agent-notes-toggle-view] side by side\n")
+                          'font-lock-face 'shadow))
+      (insert "\n"))))
 
 (defun agent-notes--point-anchor ()
   "Describe the position at point so it can be found after re-rendering."
@@ -664,21 +1005,22 @@ BASE is the face for ordinary text."
         :line (line-number-at-pos)
         :column (current-column)))
 
-(defun agent-notes--find-prop (prop value)
-  "Return the start of the first region whose PROP is VALUE."
+(defun agent-notes--find-prop (prop value &optional test)
+  "Return the start of the first region whose PROP is VALUE under TEST."
   (save-excursion
     (goto-char (point-min))
-    (let ((match (text-property-search-forward prop value #'eq)))
+    (let ((match (text-property-search-forward prop value (or test #'eq))))
       (and match (prop-match-beginning match)))))
 
 (defun agent-notes--anchor-position (anchor)
   "Return the position described by ANCHOR in the current rendering."
   (or (and (plist-get anchor :comment)
            (agent-notes--find-prop 'agent-notes-comment (plist-get anchor :comment)))
-      (and (plist-get anchor :note)
-           (agent-notes--find-prop 'agent-notes-header (plist-get anchor :note)))
+      (let ((section (and (plist-get anchor :note)
+                          (agent-notes--note-section (plist-get anchor :note)))))
+        (and section (oref section start)))
       (let ((pos (and (plist-get anchor :rec)
-                      (agent-notes--find-prop 'agent-notes-loc (plist-get anchor :rec)))))
+                      (agent-notes--find-prop 'agent-notes-loc (plist-get anchor :rec) #'equal))))
         (and pos (save-excursion (goto-char pos)
                                  (move-to-column (plist-get anchor :column))
                                  (point))))
@@ -686,15 +1028,29 @@ BASE is the face for ordinary text."
                       (forward-line (1- (plist-get anchor :line)))
                       (point))))
 
-(defun agent-notes--render ()
-  "Redraw the review buffer, keeping point on the same thing."
-  (let* ((win (get-buffer-window (current-buffer) t))
+(defun agent-notes--layout (win)
+  "Compute the widths used to render for the window WIN."
+  (setq agent-notes--width (if (window-live-p win) (window-max-chars-per-line win) 160))
+  (if (not (eq agent-notes--view 'split))
+      (setq agent-notes--pad (make-string 12 ?\s))
+    (let ((max-line 0))
+      (dolist (rec agent-notes--records)
+        (setq max-line (max max-line (or (plist-get rec :old) 0) (or (plist-get rec :new) 0))))
+      (setq agent-notes--gutter (1+ (max 4 (length (number-to-string max-line))))
+            ;; Two halves and a separator, leaving the last column free.
+            agent-notes--half (max 20 (/ (- agent-notes--width 2) 2))
+            agent-notes--pad (make-string agent-notes--gutter ?\s)))))
+
+(defun agent-notes--render (&optional win)
+  "Redraw the review buffer for WIN, keeping point on the same thing."
+  (let* ((win (or win (get-buffer-window (current-buffer) t)))
          (pos (if win (window-point win) (point)))
          (anchor (save-excursion (goto-char pos) (agent-notes--point-anchor)))
          (offset (and win (count-lines (window-start win) pos)))
          (inhibit-read-only t)
          (by-record (make-hash-table :test #'eq))
          (general nil))
+    (agent-notes--layout win)
     (setq agent-notes--placement (make-hash-table))
     (dolist (note (agent-notes--notes))
       (let ((rec (agent-notes--anchor-record note)))
@@ -703,19 +1059,32 @@ BASE is the face for ordinary text."
                    (puthash (plist-get note :id) rec agent-notes--placement))
           (push note general))))
     (erase-buffer)
-    (agent-notes--insert-header)
-    (when general
-      (insert "\n" (propertize " General notes\n" 'font-lock-face 'agent-notes-file-header))
-      (mapc #'agent-notes--insert-note (nreverse general)))
-    (dolist (rec agent-notes--records)
-      (agent-notes--insert-record rec)
-      (mapc #'agent-notes--insert-note (reverse (gethash rec by-record))))
+    (magit-insert-section (agent-notes-root)
+      (agent-notes--insert-header)
+      (when general
+        (magit-insert-section (agent-notes-general)
+          (insert (propertize "General notes\n" 'font-lock-face 'agent-notes-file-header))
+          (magit-insert-heading)
+          (mapc #'agent-notes--insert-note (nreverse general))))
+      (dolist (file (agent-notes--file-tree agent-notes--records))
+        (agent-notes--insert-file file by-record)))
+    (let ((magit-section-cache-visibility nil))
+      (magit-section-show magit-root-section))
     (let ((new-pos (agent-notes--anchor-position anchor)))
       (goto-char new-pos)
       (when win
         (set-window-point win new-pos)
         (set-window-start win (save-excursion (forward-line (- offset)) (point)) t)))
     (force-mode-line-update)))
+
+(defun agent-notes--on-window-size-change (win)
+  "Redraw the side-by-side view when the width of WIN changes."
+  (when (window-live-p win)
+    (with-current-buffer (window-buffer win)
+      (when (and (derived-mode-p 'agent-notes-mode)
+                 (eq agent-notes--view 'split)
+                 (not (eql agent-notes--width (window-max-chars-per-line win))))
+        (agent-notes--render win)))))
 
 (defun agent-notes--header-line ()
   "Return the header line of the review buffer."
@@ -743,16 +1112,20 @@ BASE is the face for ordinary text."
 
 (defun agent-notes--reload ()
   "Load the review of the current buffer from disk and redraw it."
-  (setq agent-notes--review (agent-notes--json-parse (agent-notes--read-file agent-notes--file)))
-  (setq agent-notes--records (agent-notes--parse-diff
-                              (agent-notes--read-file (agent-notes--diff-file agent-notes--file))))
-  (setq agent-notes--index (agent-notes--index-records agent-notes--records))
+  (setq agent-notes--review
+        (agent-notes--migrate (agent-notes--json-parse (agent-notes--read-file agent-notes--file))))
+  (agent-notes--set-diff (agent-notes--read-file (agent-notes--diff-file agent-notes--file)))
+  ;; Notes from older versions don't record their code yet.
+  (dolist (note (agent-notes--notes))
+    (unless (plist-get note :text)
+      (let ((rec (agent-notes--exact-record note)))
+        (when rec (plist-put note :text (agent-notes--content rec))))))
   (setq default-directory (plist-get agent-notes--review :root))
   (agent-notes--render))
 
 (defun agent-notes--revert (&rest _)
-  "Reload the review from disk."
-  (agent-notes--reload))
+  "Refresh the diff of the review."
+  (agent-notes-refresh))
 
 (defun agent-notes--get-buffer (file)
   "Return a review buffer for FILE, creating it if needed."
@@ -804,15 +1177,29 @@ BASE is the face for ordinary text."
 - \"path\": file path relative to the repository root, without a/ or b/ prefixes.
 - \"side\": \"new\" for added (+) or unchanged context lines, with the line number in the new version of the file; \"old\" for removed (-) lines, with the line number in the old version.
 - \"line\": the line number, as an integer.
-- \"severity\": one of \"issue\", \"warning\", \"suggestion\", \"question\", \"nit\".
-- \"body\": the note in Markdown. Be specific and concise; propose a fix when you have one."
+- \"severity\": one of \"issue\", \"warning\", \"suggestion\", \"question\", \"nit\", or \"info\" for explanations that are not problems.
+- \"body\": the note in Markdown. Be specific and concise; propose a fix when you have one.
+To comment on the change as a whole rather than a line, use \"path\": \"\" and \"line\": 0."
   "Description of the note format given to the agent.")
+
+(defun agent-notes--permissions-prompt ()
+  "Return the part of the prompt that says what the agent may do."
+  (if agent-notes-allow-edits
+      (concat "You may read any file in the repository and run read-only git commands for context. "
+              "You can also edit files in the repository, but only when the user asks you to "
+              "change something. Never commit, stage, stash or reset, and do not touch the "
+              "review files described above.\n")
+    (concat "You may read any file in the repository and run read-only git commands for context. "
+            "You cannot modify files in this session: when the user asks for a change, "
+            "describe it and show the code instead.\n")))
 
 (defun agent-notes--context-prompt ()
   "Return the part of the prompt describing the review."
   (let* ((review agent-notes--review)
          (base-rev (plist-get review :base_rev)))
     (concat
+     "You are helping the user go through code changes in a git repository, inside their editor. "
+     "Your notes are shown inline in the diff, and the user can reply to them.\n"
      "Repository: " (plist-get review :root) "\n"
      "Scope: "
      (if (equal (plist-get review :scope) "branch")
@@ -822,43 +1209,63 @@ BASE is the face for ordinary text."
                      ", including uncommitted and untracked files" ""))
        (format "uncommitted changes (staged, unstaged and untracked files) compared to HEAD (%s)"
                base-rev))
-     ".\nThe exact unified diff under review is saved at:\n  "
+     ".\nThe exact unified diff under review, which all line numbers refer to, is saved at:\n  "
      (agent-notes--diff-file agent-notes--file) "\n"
-     "You may read any file in the repository and run read-only git commands for context. "
-     "Do NOT modify, create or delete files, and do not run commands that change the repository.\n")))
+     "The review itself is stored in " (file-name-directory agent-notes--file) ".\n"
+     (agent-notes--permissions-prompt))))
 
-(defun agent-notes--review-prompt ()
-  "Return the prompt asking the agent to review the diff."
+(defun agent-notes--json-instructions (example)
+  "Return the instructions for the final JSON block, showing EXAMPLE."
+  (concat "Your final message must end with exactly one fenced ```json code block "
+          "and nothing after it, with this shape:\n```json\n" example "\n```\n"))
+
+(defun agent-notes--existing-notes-prompt ()
+  "Return the list of existing notes, so the agent does not repeat them."
+  (let ((notes (agent-notes--notes)))
+    (if (null notes)
+        ""
+      (concat "\nThese notes already exist on this diff; do not repeat them:\n"
+              (mapconcat (lambda (note)
+                           (format "- #%d %s: %s\n" (plist-get note :id)
+                                   (agent-notes--location note)
+                                   (agent-notes--first-line note 100)))
+                         notes "")))))
+
+(defun agent-notes--task-prompt (task)
+  "Return the prompt asking the agent to do TASK, a (NAME . INSTRUCTIONS)."
   (concat
-   "You are a meticulous senior engineer reviewing code changes.\n"
    (agent-notes--context-prompt)
-   "\nRead the diff file first. Look for bugs, incorrect logic, unhandled edge cases, "
-   "security problems, poor error handling, performance issues, unclear code and missing tests. "
-   "Prefer a few high-signal notes over many trivial ones, and do not leave notes that only praise.\n"
-   (if agent-notes-review-instructions
-       (concat "\nAdditional instructions from the user:\n" agent-notes-review-instructions "\n")
+   "\nRead the diff file first. Your task:\n" (cdr task) "\n"
+   (if agent-notes-extra-instructions
+       (concat "\nAdditional instructions from the user:\n" agent-notes-extra-instructions "\n")
      "")
-   "\n" agent-notes--note-spec "\n\n"
-   "Your final message must end with exactly one fenced ```json code block and nothing after it, "
-   "with this shape:\n"
-   "```json\n"
-   "{\"summary\": \"Two or three sentences about the change as a whole.\",\n"
-   " \"notes\": [{\"path\": \"src/example.py\", \"line\": 42, \"side\": \"new\", "
-   "\"severity\": \"warning\", \"body\": \"...\"}]}\n"
-   "```\n"))
+   (agent-notes--existing-notes-prompt)
+   "\nDo not modify any files for this task unless the task explicitly asks you to.\n\n"
+   agent-notes--note-spec "\n\n"
+   (agent-notes--json-instructions
+    (concat "{\"summary\": \"...\",\n"
+            " \"notes\": [{\"path\": \"src/example.py\", \"line\": 42, \"side\": \"new\", "
+            "\"severity\": \"warning\", \"body\": \"...\"}]}"))))
 
 (defun agent-notes--format-thread (note new-ids)
   "Return NOTE as text for the agent; comments in NEW-IDS are marked NEW."
   (let ((rec (agent-notes--exact-record note)))
     (concat
-     (format "--- Thread #%d · %s · %s line %s · started by %s%s · status: %s\n"
-             (plist-get note :id) (plist-get note :path) (plist-get note :side)
-             (plist-get note :line)
+     (format "--- Thread #%d · %s · started by %s%s · status: %s\n"
+             (plist-get note :id)
+             (if (agent-notes--general-p note)
+                 "about the whole change"
+               (format "%s %s line %s" (plist-get note :path) (plist-get note :side)
+                       (plist-get note :line)))
              (if (equal (plist-get note :author) "agent") "you (the agent)" "the user")
              (let ((s (plist-get note :severity)))
                (if (and s (not (string-empty-p s))) (format " · severity: %s" s) ""))
              (plist-get note :status))
-     (if rec (format "Diff line: %s\n" (plist-get rec :text)) "")
+     (cond ((plist-get note :outdated)
+            (format "The code this thread was about has changed; it was: %s\n"
+                    (plist-get note :text)))
+           (rec (format "Diff line: %s\n" (plist-get rec :text)))
+           (t ""))
      (mapconcat (lambda (c)
                   (format "[%s%s]\n%s\n"
                           (if (equal (plist-get c :author) "agent") "agent" "user")
@@ -870,22 +1277,24 @@ BASE is the face for ordinary text."
 (defun agent-notes--reply-prompt (notes new-ids)
   "Return the prompt sending the user's comments in NEW-IDS on NOTES."
   (concat
-   "The user has read the code review and responded.\n"
+   "The user has gone through the notes on the diff and responded.\n"
    (agent-notes--context-prompt)
-   "The code has not changed since the review.\n\n"
-   "Below are the review threads that have new messages from the user (marked NEW). "
+   "\nBelow are the threads with new messages from the user (marked NEW). "
    "Threads started by the user are new comments or questions for you. "
    "Answer every thread that has NEW messages. Be direct and concise; if the user is right, say so. "
    "Set \"resolve\" to true only when the thread's concern is settled. "
-   "If the discussion reveals other problems, you may add new notes.\n\n"
+   "If the discussion reveals other problems, you may add new notes.\n"
+   (if agent-notes-allow-edits
+       (concat "When a message asks you to change the code, make the change by editing the "
+               "files, then say in your reply which files and lines you changed. Do not change "
+               "anything the user did not ask for. The diff is refreshed after you finish and "
+               "the notes move with the code.\n")
+     "")
+   "\n"
    (mapconcat (lambda (note) (agent-notes--format-thread note new-ids)) notes "")
    agent-notes--note-spec "\n\n"
-   "Your final message must end with exactly one fenced ```json code block and nothing after it, "
-   "with this shape:\n"
-   "```json\n"
-   "{\"replies\": [{\"note\": 3, \"body\": \"...\", \"resolve\": false}],\n"
-   " \"notes\": []}\n"
-   "```\n"))
+   (agent-notes--json-instructions
+    "{\"replies\": [{\"note\": 3, \"body\": \"...\", \"resolve\": false}],\n \"notes\": []}")))
 
 (defun agent-notes--add-agent-note (spec)
   "Add the note described by the agent's JSON SPEC."
@@ -899,13 +1308,17 @@ BASE is the face for ordinary text."
                              (if (stringp severity) severity "suggestion")
                              body "sent"))))
 
-(defun agent-notes--apply-review (data _in-flight)
-  "Store the review DATA returned by the agent."
+(defun agent-notes--apply-review (data task-name)
+  "Store the result DATA of the task TASK-NAME returned by the agent."
   (unless (or (plist-member data :notes) (plist-member data :summary))
     (error "The agent's answer has no \"notes\""))
   (let ((summary (plist-get data :summary)))
     (when (and (stringp summary) (not (string-blank-p summary)))
-      (setq agent-notes--review (plist-put agent-notes--review :summary summary))))
+      (setq agent-notes--review
+            (plist-put agent-notes--review :summaries
+                       (append (plist-get agent-notes--review :summaries)
+                               (list (list :task task-name :text summary
+                                           :time (format-time-string "%F %R"))))))))
   (mapc #'agent-notes--add-agent-note (plist-get data :notes)))
 
 (defun agent-notes--apply-replies (data in-flight)
@@ -929,6 +1342,21 @@ BASE is the face for ordinary text."
           (plist-put note :status "resolved")))))
   (mapc #'agent-notes--add-agent-note (plist-get data :notes)))
 
+(defun agent-notes--copilot-args (prompt)
+  "Return the Copilot arguments to run PROMPT in the review session."
+  (let ((allowed (if agent-notes-allow-edits
+                     (append agent-notes-allowed-tools '("write"))
+                   agent-notes-allowed-tools))
+        (denied (if agent-notes-allow-edits
+                    (remove "write" agent-notes-denied-tools)
+                  (cl-adjoin "write" agent-notes-denied-tools :test #'equal))))
+    (append (list "-s" "--session-id" (plist-get agent-notes--review :session)
+                  (concat "--add-dir=" (file-name-directory agent-notes--file)))
+            (mapcar (lambda (tool) (concat "--allow-tool=" tool)) allowed)
+            (mapcar (lambda (tool) (concat "--deny-tool=" tool)) denied)
+            agent-notes-copilot-extra-args
+            (list "-p" prompt))))
+
 (defun agent-notes--run (label prompt on-success &optional in-flight)
   "Run Copilot with PROMPT in the review session.
 LABEL describes the request.  On success, call ON-SUCCESS with the
@@ -938,18 +1366,15 @@ parsed JSON answer and IN-FLIGHT, the ids of the comments sent."
                 agent-notes-copilot-program))
   (let* ((file agent-notes--file)
          (default-directory (plist-get agent-notes--review :root))
-         (args (append (list "-s" "--session-id" (plist-get agent-notes--review :session)
-                             (concat "--add-dir=" (file-name-directory file)))
-                       (mapcar (lambda (tool) (concat "--allow-tool=" tool))
-                               agent-notes-allowed-tools)
-                       (mapcar (lambda (tool) (concat "--deny-tool=" tool))
-                               agent-notes-denied-tools)
-                       agent-notes-copilot-extra-args
-                       (list "-p" prompt))))
+         ;; To tell which files the agent changes.
+         (before (ignore-errors
+                   (agent-notes--fingerprints (car (agent-notes--snapshot-diff agent-notes--review)))))
+         (args (agent-notes--copilot-args prompt)))
     (agent-notes--log "%s: %s %s\n%s" label agent-notes-copilot-program
                       (mapconcat #'shell-quote-argument (butlast args 2) " ")
                       prompt)
     (setq agent-notes--in-flight in-flight
+          agent-notes--changes nil
           agent-notes--status (concat label "…")
           agent-notes--process
           (make-process
@@ -960,30 +1385,65 @@ parsed JSON answer and IN-FLIGHT, the ids of the comments sent."
            :coding 'utf-8
            :noquery t
            :sentinel (lambda (proc _event)
-                       (agent-notes--sentinel proc file label on-success in-flight))))
+                       (agent-notes--sentinel proc file label on-success in-flight before))))
     (agent-notes--render)))
 
-(defun agent-notes--sentinel (proc file label on-success in-flight)
+(defun agent-notes--detect-changes (before)
+  "Find the files changed since BEFORE and refresh the diff if needed.
+BEFORE is the result of `agent-notes--fingerprints' when the agent
+started.  Return a message describing what happened, or nil."
+  (let* ((snapshot (agent-notes--snapshot-diff agent-notes--review))
+         (diff (car snapshot))
+         (after (agent-notes--fingerprints diff))
+         (stale (not (equal diff (agent-notes--read-file
+                                  (agent-notes--diff-file agent-notes--file)))))
+         (changed nil))
+    (when before
+      (dolist (entry (append before after))
+        (let ((path (car entry)))
+          (unless (or (member path changed)
+                      (equal (cdr (assoc path before)) (cdr (assoc path after))))
+            (push path changed))))
+      (setq agent-notes--changes (nreverse changed)))
+    (when stale
+      (let ((what (if agent-notes--changes
+                      (format "the agent changed %s" (string-join agent-notes--changes ", "))
+                    "the code changed")))
+        (if (not agent-notes-auto-refresh)
+            (format "%s; press g to refresh the diff" what)
+          (pcase-let ((`(,moved . ,outdated) (agent-notes--resnapshot snapshot)))
+            (format "%s; diff refreshed (%d note%s moved, %d outdated)" what
+                    moved (if (= moved 1) "" "s") outdated)))))))
+
+(defun agent-notes--sentinel (proc file label on-success in-flight before)
   "Handle the end of the Copilot PROC for the review FILE.
-LABEL, ON-SUCCESS and IN-FLIGHT are as in `agent-notes--run'."
+LABEL, ON-SUCCESS and IN-FLIGHT are as in `agent-notes--run'.
+BEFORE is as in `agent-notes--detect-changes'."
   (when (memq (process-status proc) '(exit signal))
     (let ((output (with-current-buffer (process-buffer proc) (buffer-string)))
           (code (process-exit-status proc))
-          (ok (and (eq (process-status proc) 'exit) (zerop (process-exit-status proc)))))
+          (ok (and (eq (process-status proc) 'exit) (zerop (process-exit-status proc))))
+          (changes nil))
       (kill-buffer (process-buffer proc))
       (agent-notes--log "%s finished (exit code %s):\n%s" label code output)
       (with-current-buffer (agent-notes--get-buffer file)
         (setq agent-notes--process nil
               agent-notes--status nil
               agent-notes--in-flight nil)
+        ;; Refresh first, so new notes are anchored to the code as it is now.
+        (condition-case err
+            (setq changes (agent-notes--detect-changes before))
+          (error (agent-notes--log "Could not check for changes: %s"
+                                   (error-message-string err))))
         (condition-case err
             (progn
               (unless ok (error "Copilot exited with code %s" code))
               (funcall on-success (agent-notes--extract-json output) in-flight)
               (agent-notes--save)
-              (message "Agent Notes: %s done" label))
-          (error (message "Agent Notes: %s failed: %s (press $ for the log)"
-                          label (error-message-string err))))
+              (message "Agent Notes: %s done%s" label (if changes (concat "; " changes) "")))
+          (error (message "Agent Notes: %s failed: %s%s (press $ for the log)"
+                          label (error-message-string err)
+                          (if changes (concat "; " changes) ""))))
         (agent-notes--render)))))
 
 ;;;; Compose buffer
@@ -1053,94 +1513,127 @@ When done, call CALLBACK with the text in the review buffer."
   "Return the note at point or signal an error."
   (or (agent-notes--note-at-point) (user-error "No note at point")))
 
+(defun agent-notes--sections (type &optional pred)
+  "Return the sections of TYPE that satisfy PRED, in buffer order."
+  (let (result)
+    (when magit-root-section
+      (magit-map-sections (lambda (section)
+                            (when (and (eq (oref section type) type)
+                                       (or (null pred) (funcall pred section)))
+                              (push section result)))))
+    (sort result (lambda (a b) (< (oref a start) (oref b start))))))
+
+(defun agent-notes--note-section (id)
+  "Return the section of the note ID, or nil."
+  (car (agent-notes--sections 'agent-notes-note
+                              (lambda (section) (eql (oref section value) id)))))
+
+(defun agent-notes--goto-section (section)
+  "Move point to SECTION, unfolding the sections that contain it."
+  (let ((parent (oref section parent)))
+    (when parent (magit-section-reveal parent)))
+  (goto-char (oref section start))
+  (let ((win (get-buffer-window (current-buffer))))
+    (when win (set-window-point win (point)))))
+
 (defun agent-notes--goto-note (id &optional comment-id)
   "Move point to the note ID, or to its comment COMMENT-ID."
-  (let ((pos (or (and comment-id (agent-notes--find-prop 'agent-notes-comment comment-id))
-                 (agent-notes--find-prop 'agent-notes-header id))))
-    (when pos
-      (goto-char pos)
-      (let ((win (get-buffer-window (current-buffer))))
-        (when win (set-window-point win pos))))))
+  (let ((section (agent-notes--note-section id)))
+    (when section
+      (agent-notes--goto-section section)
+      (when comment-id
+        (magit-section-show section)
+        (let ((pos (agent-notes--find-prop 'agent-notes-comment comment-id)))
+          (when pos
+            (goto-char pos)
+            (let ((win (get-buffer-window (current-buffer))))
+              (when win (set-window-point win pos)))))))))
 
-(defun agent-notes--prop-starts (prop)
-  "Return (POS . VALUE) for the start of every region with a non-nil PROP."
-  (let ((pos (point-min)) result)
-    (while (< pos (point-max))
-      (let ((value (get-text-property pos prop)))
-        (when value (push (cons pos value) result)))
-      (setq pos (or (next-single-property-change pos prop) (point-max))))
-    (nreverse result)))
-
-(defun agent-notes--jump (prop forward &optional pred what)
-  "Move to the next region with PROP; backward unless FORWARD.
-PRED filters the values of PROP.  WHAT names the targets in messages."
-  (let* ((targets (cl-remove-if-not (lambda (target) (or (null pred) (funcall pred (cdr target))))
-                                    (agent-notes--prop-starts prop)))
+(defun agent-notes--jump (type forward what &optional pred)
+  "Move to the next section of TYPE; backward unless FORWARD.
+PRED filters the sections.  WHAT names them in messages."
+  (let* ((targets (agent-notes--sections type pred))
          (bol (line-beginning-position))
          (eol (line-end-position))
          (target (if forward
-                     (cl-find-if (lambda (target) (> (car target) eol)) targets)
-                   (cl-find-if (lambda (target) (< (car target) bol)) (reverse targets)))))
-    (unless targets (user-error "No %s" (or what "targets")))
+                     (cl-find-if (lambda (s) (> (oref s start) eol)) targets)
+                   (cl-find-if (lambda (s) (< (oref s start) bol)) (reverse targets)))))
+    (unless targets (user-error "No %s" what))
     (unless target
       (setq target (if forward (car targets) (car (last targets))))
       (message "Wrapped around"))
-    (goto-char (car target))
-    (when (eq prop 'agent-notes-header)
-      (message "Note #%d (%d of %d)" (cdr target)
+    (agent-notes--goto-section target)
+    (when (eq type 'agent-notes-note)
+      (message "Note #%d (%d of %d)" (oref target value)
                (1+ (cl-position target targets)) (length targets)))))
 
-(defun agent-notes--agent-note-p (id)
-  "Return non-nil if the note ID was written by the agent."
-  (equal (plist-get (agent-notes--note id) :author) "agent"))
+(defun agent-notes--agent-section-p (section)
+  "Return non-nil if SECTION is a note written by the agent."
+  (equal (plist-get (agent-notes--note (oref section value)) :author) "agent"))
 
 (defun agent-notes-next-note ()
   "Move to the next note."
   (interactive)
-  (agent-notes--jump 'agent-notes-header t nil "notes"))
+  (agent-notes--jump 'agent-notes-note t "notes"))
 
 (defun agent-notes-previous-note ()
   "Move to the previous note."
   (interactive)
-  (agent-notes--jump 'agent-notes-header nil nil "notes"))
+  (agent-notes--jump 'agent-notes-note nil "notes"))
 
 (defun agent-notes-next-agent-note ()
   "Move to the next note written by the agent."
   (interactive)
-  (agent-notes--jump 'agent-notes-header t #'agent-notes--agent-note-p "agent notes"))
+  (agent-notes--jump 'agent-notes-note t "agent notes" #'agent-notes--agent-section-p))
 
 (defun agent-notes-previous-agent-note ()
   "Move to the previous note written by the agent."
   (interactive)
-  (agent-notes--jump 'agent-notes-header nil #'agent-notes--agent-note-p "agent notes"))
+  (agent-notes--jump 'agent-notes-note nil "agent notes" #'agent-notes--agent-section-p))
+
+(defun agent-notes-next-hunk ()
+  "Move to the next hunk, in this file or the next one."
+  (interactive)
+  (agent-notes--jump 'agent-notes-hunk t "hunks"))
+
+(defun agent-notes-previous-hunk ()
+  "Move to the previous hunk, in this file or the previous one."
+  (interactive)
+  (agent-notes--jump 'agent-notes-hunk nil "hunks"))
 
 (defun agent-notes-next-file ()
   "Move to the next file."
   (interactive)
-  (agent-notes--jump 'agent-notes-file t nil "files"))
+  (agent-notes--jump 'agent-notes-file t "files"))
 
 (defun agent-notes-previous-file ()
   "Move to the previous file."
   (interactive)
-  (agent-notes--jump 'agent-notes-file nil nil "files"))
+  (agent-notes--jump 'agent-notes-file nil "files"))
+
+(defun agent-notes--compose-new-note (title path side line)
+  "Compose a note titled TITLE at LINE on SIDE of PATH."
+  (agent-notes--compose
+   title nil
+   (lambda (body)
+     (let ((note (agent-notes--add-note "you" path side line "" body "pending")))
+       (agent-notes--save)
+       (agent-notes--render)
+       (agent-notes--goto-note (plist-get note :id))))))
 
 (defun agent-notes-new-note ()
-  "Write a new note on the line of code at point."
+  "Write a new note on the line of code at point.
+Elsewhere, offer to write a general note about the whole change."
   (interactive)
-  (let ((rec (get-text-property (point) 'agent-notes-loc)))
-    (unless (and rec (memq (plist-get rec :kind) '(context added removed))
-                 (not (get-text-property (point) 'agent-notes-note)))
-      (user-error "Move point to a line of code in the diff"))
-    (let* ((side (if (eq (plist-get rec :kind) 'removed) "old" "new"))
-           (line (plist-get rec (if (equal side "old") :old :new)))
-           (path (plist-get rec :path)))
-      (agent-notes--compose
-       (format "New note on %s:%d" path line) nil
-       (lambda (body)
-         (let ((note (agent-notes--add-note "you" path side line "" body "pending")))
-           (agent-notes--save)
-           (agent-notes--render)
-           (agent-notes--goto-note (plist-get note :id))))))))
+  (let ((rec (and (not (get-text-property (point) 'agent-notes-note))
+                  (get-text-property (point) 'agent-notes-loc))))
+    (if (and rec (agent-notes--code-p rec))
+        (let* ((side (agent-notes--rec-side rec))
+               (line (agent-notes--rec-line rec side))
+               (path (plist-get rec :path)))
+          (agent-notes--compose-new-note (format "New note on %s:%d" path line) path side line))
+      (when (y-or-n-p "Point is not on a line of code.  Write a general note? ")
+        (agent-notes--compose-new-note "New general note" "" "new" 0)))))
 
 (defun agent-notes-reply ()
   "Reply to the note at point.  The reply is sent with \\[agent-notes-send]."
@@ -1152,7 +1645,6 @@ PRED filters the values of PROP.  WHAT names the targets in messages."
        (let ((note (or (agent-notes--note id) (user-error "Note #%d no longer exists" id)))
              (comment (agent-notes--make-comment "you" body "pending")))
          (plist-put note :comments (append (plist-get note :comments) (list comment)))
-         (puthash id nil agent-notes--folded)
          (agent-notes--save)
          (agent-notes--render)
          (agent-notes--goto-note id (plist-get comment :id)))))))
@@ -1202,44 +1694,66 @@ Deleting the first comment of your own note deletes the whole note."
     (agent-notes--render)))
 
 (defun agent-notes-toggle-resolved ()
-  "Resolve the note at point, or reopen it if it is resolved."
+  "Resolve the note at point, or reopen it if it is resolved.
+Resolved notes are folded."
   (interactive)
-  (let ((note (agent-notes--require-note)))
-    (plist-put note :status (if (agent-notes--resolved-p note) "open" "resolved"))
-    (remhash (plist-get note :id) agent-notes--folded)
+  (let* ((note (agent-notes--require-note))
+         (id (plist-get note :id))
+         (resolved (not (agent-notes--resolved-p note))))
+    (plist-put note :status (if resolved "resolved" "open"))
     (agent-notes--save)
     (agent-notes--render)
-    (message "Note #%d %s" (plist-get note :id) (plist-get note :status))))
+    (let ((section (agent-notes--note-section id)))
+      (when section
+        (if resolved (magit-section-hide section) (magit-section-show section))))
+    (message "Note #%d %s" id (plist-get note :status))))
 
-(defun agent-notes-toggle-fold ()
-  "Fold or unfold the note at point."
+(defun agent-notes-toggle-view ()
+  "Switch between the unified and the side-by-side diff."
   (interactive)
-  (let ((note (agent-notes--require-note)))
-    (puthash (plist-get note :id) (not (agent-notes--collapsed-p note)) agent-notes--folded)
-    (agent-notes--render)))
+  (setq agent-notes--view (if (eq agent-notes--view 'split) 'unified 'split))
+  (agent-notes--render)
+  (message "%s view" (if (eq agent-notes--view 'split) "Side-by-side" "Unified")))
+
+(defun agent-notes-refresh ()
+  "Snapshot the changes again and move the notes along with their code.
+The scope and base of the review stay the same."
+  (interactive)
+  (agent-notes--ensure-idle)
+  (let ((snapshot (agent-notes--snapshot-diff agent-notes--review)))
+    (if (equal (car snapshot) (agent-notes--read-file (agent-notes--diff-file agent-notes--file)))
+        (progn (agent-notes--reload)
+               (message "No changes since the last snapshot"))
+      (pcase-let ((`(,moved . ,outdated) (agent-notes--resnapshot snapshot)))
+        (agent-notes--render)
+        (message "Diff refreshed: %d note%s moved, %d outdated"
+                 moved (if (= moved 1) "" "s") outdated)))))
 
 (defun agent-notes--describe-note (note)
   "Return a one-line description of NOTE."
-  (format "#%-3d %-6s %-10s %-8s %s:%s  %s"
+  (format "#%-3d %-6s %-10s %-8s %s  %s"
           (plist-get note :id) (plist-get note :author)
           (or (plist-get note :severity) "") (plist-get note :status)
-          (plist-get note :path) (plist-get note :line)
-          (truncate-string-to-width
-           (car (split-string (plist-get (car (plist-get note :comments)) :body) "\n"))
-           60 nil nil "…")))
+          (agent-notes--location note)
+          (agent-notes--first-line note 60)))
+
+(defun agent-notes--completion-table (candidates)
+  "Return a completion table for CANDIDATES that keeps their order."
+  (lambda (string pred action)
+    (if (eq action 'metadata)
+        '(metadata (display-sort-function . identity))
+      (complete-with-action action candidates string pred))))
 
 (defun agent-notes-list ()
   "Jump to a note chosen from a list."
   (interactive)
-  (let* ((candidates (mapcar (lambda (note) (cons (agent-notes--describe-note note)
-                                                  (plist-get note :id)))
-                             (agent-notes--notes)))
-         (table (lambda (string pred action)
-                  (if (eq action 'metadata)
-                      '(metadata (display-sort-function . identity))
-                    (complete-with-action action candidates string pred)))))
+  (let ((candidates (mapcar (lambda (note) (cons (agent-notes--describe-note note)
+                                                 (plist-get note :id)))
+                            (agent-notes--notes))))
     (unless candidates (user-error "No notes"))
-    (agent-notes--goto-note (cdr (assoc (completing-read "Note: " table nil t) candidates)))))
+    (agent-notes--goto-note
+     (cdr (assoc (completing-read "Note: " (agent-notes--completion-table candidates) nil t)
+                 candidates)))))
 
 (defun agent-notes-visit ()
   "Open the file of the line or note at point, read-only."
@@ -1248,10 +1762,11 @@ Deleting the first comment of your own note deletes the whole note."
          (rec (if note
                   (gethash (plist-get note :id) agent-notes--placement)
                 (get-text-property (point) 'agent-notes-loc)))
-         (path (or (plist-get note :path) (plist-get rec :path)))
+         (path (if note (plist-get note :path) (plist-get rec :path)))
          (line (cond ((and note (equal (plist-get note :side) "new")) (plist-get note :line))
                      (rec (plist-get rec :new))))
-         (file (and path (expand-file-name path (plist-get agent-notes--review :root)))))
+         (file (and path (not (string-empty-p path))
+                    (expand-file-name path (plist-get agent-notes--review :root)))))
     (unless file (user-error "Nothing to visit here"))
     (unless (file-exists-p file) (user-error "%s does not exist in the working tree" path))
     (find-file-read-only-other-window file)
@@ -1275,13 +1790,39 @@ Deleting the first comment of your own note deletes the whole note."
       (agent-notes--run "replying" (agent-notes--reply-prompt notes ids)
                         #'agent-notes--apply-replies ids))))
 
-(defun agent-notes-request-review ()
-  "Ask the agent to review the diff.  New notes are added to existing ones."
-  (interactive)
+(defconst agent-notes--custom-task "Custom instructions…"
+  "Completion candidate for typing your own instructions.")
+
+(defun agent-notes--read-task ()
+  "Read a task for the agent; return (NAME . INSTRUCTIONS).
+Text that is not the name of a task in `agent-notes-tasks' is used
+as the instructions."
+  (let* ((names (mapcar #'car agent-notes-tasks))
+         (choice (string-trim
+                  (completing-read (format-prompt "Task (or type instructions)" (car names))
+                                   (append names (list agent-notes--custom-task))
+                                   nil nil nil 'agent-notes--task-history (car names)))))
+    (when (equal choice agent-notes--custom-task)
+      (setq choice (string-trim (read-string "Instructions for the agent: "))))
+    (when (string-empty-p choice)
+      (user-error "No task given"))
+    (or (assoc choice agent-notes-tasks)
+        (cons (truncate-string-to-width (car (split-string choice "\n")) 40 nil nil "…")
+              choice))))
+
+(defun agent-notes--start-task (task)
+  "Ask the agent to do TASK, a (NAME . INSTRUCTIONS), on the current review."
+  (let ((name (car task)))
+    (agent-notes--run name (agent-notes--task-prompt task)
+                      (lambda (data _) (agent-notes--apply-review data name)))))
+
+(defun agent-notes-request-review (task)
+  "Give the agent TASK on this diff; its notes are added to the existing ones.
+Interactively, choose a task from `agent-notes-tasks' or type your
+own instructions."
+  (interactive (progn (agent-notes--ensure-idle) (list (agent-notes--read-task))))
   (agent-notes--ensure-idle)
-  (when (or (null (agent-notes--notes))
-            (y-or-n-p "Ask the agent to review again? New notes will be added. "))
-    (agent-notes--run "reviewing" (agent-notes--review-prompt) #'agent-notes--apply-review)))
+  (agent-notes--start-task task))
 
 (defun agent-notes-abort ()
   "Stop the running agent request."
@@ -1297,14 +1838,60 @@ Deleting the first comment of your own note deletes the whole note."
     (with-current-buffer buf (goto-char (point-max)))
     (display-buffer buf)))
 
+;;;; Menus
+
+(transient-define-prefix agent-notes-dispatch ()
+  "Show the commands of the review buffer."
+  [["Move"
+    ("n" "Next note" agent-notes-next-note)
+    ("p" "Previous note" agent-notes-previous-note)
+    ("N" "Next agent note" agent-notes-next-agent-note)
+    ("P" "Previous agent note" agent-notes-previous-agent-note)
+    ("M-n" "Next hunk" agent-notes-next-hunk)
+    ("M-p" "Previous hunk" agent-notes-previous-hunk)
+    ("}" "Next file" agent-notes-next-file)
+    ("{" "Previous file" agent-notes-previous-file)
+    ("l" "Jump to a note…" agent-notes-list)]
+   ["Notes"
+    ("c" "New note" agent-notes-new-note)
+    ("r" "Reply" agent-notes-reply)
+    ("e" "Edit unsent comment" agent-notes-edit)
+    ("k" "Delete unsent comment" agent-notes-delete)
+    ("R" "Resolve / reopen" agent-notes-toggle-resolved)]
+   ["Agent"
+    ("s" "Send unsent comments" agent-notes-send)
+    ("A" "Give a task…" agent-notes-request-review)
+    ("x" "Abort" agent-notes-abort)
+    ("$" "Show log" agent-notes-show-log)]
+   ["View"
+    ("v" "Unified / side by side" agent-notes-toggle-view)
+    ("g" "Refresh diff" agent-notes-refresh)
+    ("o" "Visit file" agent-notes-visit)
+    (:info "TAB  fold section")
+    (:info "RET  visit file")
+    (:info "^    parent section")
+    (:info "1-4  show levels")]])
+
+;;;###autoload (autoload 'agent-notes-menu "agent-notes" nil t)
+(transient-define-prefix agent-notes-menu ()
+  "Review the changes in the current repository with an agent."
+  ["Agent notes"
+   ("w" "Review working tree…" agent-notes-review-working-tree)
+   ("b" "Review branch…" agent-notes-review-branch)
+   ("l" "Open latest review" agent-notes-open-latest)
+   ("o" "Open a review…" agent-notes-open)])
+
 ;;;; Mode
 
 (defvar-keymap agent-notes-mode-map
-  :parent special-mode-map
+  :doc "Keymap for `agent-notes-mode'."
+  :parent magit-section-mode-map
   "n" #'agent-notes-next-note
   "p" #'agent-notes-previous-note
   "N" #'agent-notes-next-agent-note
   "P" #'agent-notes-previous-agent-note
+  "M-n" #'agent-notes-next-hunk
+  "M-p" #'agent-notes-previous-hunk
   "}" #'agent-notes-next-file
   "{" #'agent-notes-previous-file
   "c" #'agent-notes-new-note
@@ -1313,27 +1900,44 @@ Deleting the first comment of your own note deletes the whole note."
   "k" #'agent-notes-delete
   "R" #'agent-notes-toggle-resolved
   "s" #'agent-notes-send
-  "TAB" #'agent-notes-toggle-fold
   "l" #'agent-notes-list
   "RET" #'agent-notes-visit
+  "o" #'agent-notes-visit
   "A" #'agent-notes-request-review
+  "v" #'agent-notes-toggle-view
+  "g" #'agent-notes-refresh
   "$" #'agent-notes-show-log
-  "C-c C-k" #'agent-notes-abort)
+  "x" #'agent-notes-abort
+  "C-c C-k" #'agent-notes-abort
+  "?" #'agent-notes-dispatch
+  "h" #'agent-notes-dispatch)
 
-(define-derived-mode agent-notes-mode special-mode "Agent-Notes"
-  "Major mode for reviewing a diff together with an AI agent.
+(put 'agent-notes-dispatch :advertised-binding "?")
+
+(define-derived-mode agent-notes-mode magit-section-mode "Agent-Notes"
+  "Major mode for going through a diff together with an AI agent.
 
 Your notes and replies are queued as \"unsent\" until you send them
-all with \\[agent-notes-send].
+all with \\[agent-notes-send].  Press \\[agent-notes-dispatch] for a menu of all commands.
 
 \\{agent-notes-mode-map}"
+  :interactive nil
   (setq-local truncate-lines nil)
   (setq-local word-wrap t)
+  ;; Highlighting the current section would hide the diff colors.
+  (setq-local magit-section-highlight-current nil)
   (setq-local revert-buffer-function #'agent-notes--revert)
   (setq-local header-line-format '(:eval (agent-notes--header-line)))
-  (setq agent-notes--folded (make-hash-table)))
+  (setq agent-notes--view agent-notes-default-view)
+  (add-hook 'window-size-change-functions #'agent-notes--on-window-size-change nil t))
 
 ;;;; Entry points
+
+(defun agent-notes--read-base ()
+  "Read the base branch of a branch review."
+  (let ((default (agent-notes--default-base)))
+    (completing-read (format-prompt "Base branch" default)
+                     (agent-notes--branches) nil nil nil nil default)))
 
 (defun agent-notes--read-scope ()
   "Read the scope of a new review; return (SCOPE BASE)."
@@ -1343,48 +1947,64 @@ all with \\[agent-notes-send].
                                   nil t nil nil working)))
     (if (equal choice working)
         (list "working" nil)
-      (let ((default (agent-notes--default-base)))
-        (list "branch"
-              (completing-read (format-prompt "Base branch" default)
-                               (agent-notes--branches) nil nil nil nil default))))))
+      (list "branch" (agent-notes--read-base)))))
 
 ;;;###autoload
-(defun agent-notes-review (scope &optional base)
-  "Snapshot the changes in SCOPE and ask the agent to review them.
+(defun agent-notes-review (scope &optional base task)
+  "Snapshot the changes in SCOPE and give the agent TASK on them.
 SCOPE is \"working\" for uncommitted changes against HEAD, or
-\"branch\" for everything since the current branch forked from BASE."
+\"branch\" for everything since the current branch forked from BASE.
+TASK is a (NAME . INSTRUCTIONS); it defaults to the first entry of
+`agent-notes-tasks'."
   (interactive (let ((default-directory (agent-notes--root)))
-                 (agent-notes--read-scope)))
+                 (append (agent-notes--read-scope) (list (agent-notes--read-task)))))
   (let* ((default-directory (agent-notes--root))
-         (root default-directory))
+         (root default-directory)
+         (task (or task (car agent-notes-tasks)
+                   (user-error "No task given; see `agent-notes-tasks'"))))
     (pcase-let ((`(,diff ,base-label ,base-rev ,head) (agent-notes--make-diff scope base)))
       (when (string-blank-p diff)
         (user-error "No changes to review"))
       (let* ((id (format-time-string "%Y%m%d-%H%M%S"))
              (dir (agent-notes--directory))
              (file (expand-file-name (concat id ".json") dir))
-             (review (list :version 1 :id id :root root :scope scope
+             (review (list :version 2 :id id :root root :scope scope
                            :base base-label :base_rev base-rev :head_rev head
                            :created (format-time-string "%F %R")
-                           :session (agent-notes--uuid) :summary ""
-                           :next_note 1 :next_comment 1 :notes nil)))
+                           :session (agent-notes--uuid)
+                           :next_note 1 :next_comment 1 :summaries nil :notes nil)))
         (make-directory dir t)
         (agent-notes--write-file (agent-notes--diff-file file) diff)
         (agent-notes--write-file file (agent-notes--serialize review))
         (let ((buf (agent-notes--get-buffer file)))
           (pop-to-buffer-same-window buf)
           (with-current-buffer buf
-            (agent-notes--run "reviewing" (agent-notes--review-prompt)
-                              #'agent-notes--apply-review)))))))
+            (agent-notes--start-task task)))))))
+
+;;;###autoload
+(defun agent-notes-review-working-tree (task)
+  "Give the agent TASK on the uncommitted changes of the repository."
+  (interactive (progn (agent-notes--root) (list (agent-notes--read-task))))
+  (agent-notes-review "working" nil task))
+
+;;;###autoload
+(defun agent-notes-review-branch (base task)
+  "Give the agent TASK on all changes since the current branch forked from BASE."
+  (interactive (let ((default-directory (agent-notes--root)))
+                 (list (agent-notes--read-base) (agent-notes--read-task))))
+  (agent-notes-review "branch" base task))
+
+(defun agent-notes--review-files ()
+  "Return the review files of the current repository, newest first."
+  (let ((dir (agent-notes--directory)))
+    (and (file-directory-p dir)
+         (reverse (directory-files dir t "\\.json\\'")))))
 
 ;;;###autoload
 (defun agent-notes-open ()
   "Open a previous review of the current repository."
   (interactive)
   (let* ((default-directory (agent-notes--root))
-         (dir (agent-notes--directory))
-         (files (and (file-directory-p dir)
-                     (reverse (directory-files dir t "\\.json\\'"))))
          (candidates
           (mapcar (lambda (file)
                     (let* ((review (agent-notes--json-parse (agent-notes--read-file file)))
@@ -1395,15 +2015,85 @@ SCOPE is \"working\" for uncommitted changes against HEAD, or
                                     (cl-count-if-not #'agent-notes--resolved-p notes)
                                     (length notes))
                             file)))
-                  files))
-         (table (lambda (string pred action)
-                  (if (eq action 'metadata)
-                      '(metadata (display-sort-function . identity))
-                    (complete-with-action action candidates string pred)))))
+                  (agent-notes--review-files))))
     (unless candidates (user-error "No reviews yet; use M-x agent-notes-review"))
     (pop-to-buffer-same-window
-     (agent-notes--get-buffer (cdr (assoc (completing-read "Open review: " table nil t)
-                                          candidates))))))
+     (agent-notes--get-buffer
+      (cdr (assoc (completing-read "Open review: " (agent-notes--completion-table candidates)
+                                   nil t)
+                  candidates))))))
+
+;;;###autoload
+(defun agent-notes-open-latest ()
+  "Open the most recent review of the current repository."
+  (interactive)
+  (let* ((default-directory (agent-notes--root))
+         (file (car (agent-notes--review-files))))
+    (unless file (user-error "No reviews yet; use M-x agent-notes-review"))
+    (pop-to-buffer-same-window (agent-notes--get-buffer file))))
+
+;;;; Magit integration
+
+(defvar magit-mode-map)
+(defvar magit-status-sections-hook)
+
+(defun agent-notes-open-at-point ()
+  "Open the review of the Agent Notes section at point."
+  (interactive)
+  (let ((section (magit-current-section)))
+    (unless (and section (eq (oref section type) 'agent-notes))
+      (user-error "No review here"))
+    (pop-to-buffer-same-window (agent-notes--get-buffer (oref section value)))))
+
+;; Magit finds a section's keymap by the name `magit-TYPE-section-map'.
+(defvar-keymap magit-agent-notes-section-map
+  :doc "Keymap for the Agent Notes section in the Magit status buffer."
+  "RET" #'agent-notes-open-at-point
+  "<remap> <magit-visit-thing>" #'agent-notes-open-at-point)
+
+(defun agent-notes-insert-status-section ()
+  "Insert a line about the latest review into the Magit status buffer."
+  (when agent-notes-magit-status-section
+    (let* ((file (ignore-errors (car (agent-notes--review-files))))
+           (review (and file (ignore-errors
+                               (agent-notes--json-parse (agent-notes--read-file file))))))
+      (when review
+        (let* ((notes (plist-get review :notes))
+               (open (cl-count-if-not #'agent-notes--resolved-p notes))
+               (unsent (cl-loop for note in notes
+                                sum (cl-count-if #'agent-notes--pending-p
+                                                 (plist-get note :comments)))))
+          (magit-insert-section (agent-notes file)
+            (insert (propertize "Agent review: " 'font-lock-face 'magit-section-heading)
+                    (agent-notes--scope-label review)
+                    (format " · %d open" open)
+                    (if (> unsent 0)
+                        (propertize (format ", %d unsent" unsent)
+                                    'font-lock-face 'agent-notes-pending)
+                      "")
+                    (propertize (format " · %s" (plist-get review :created))
+                                'font-lock-face 'shadow)
+                    "\n\n")))))))
+
+(defun agent-notes--magit-setup ()
+  "Add Agent Notes to Magit: `@' in Magit buffers and `magit-dispatch'.
+Also add the status section; see `agent-notes-magit-status-section'."
+  (keymap-set magit-mode-map "@" #'agent-notes-menu)
+  (condition-case err
+      (unless (ignore-errors (transient-get-suffix 'magit-dispatch "@"))
+        (transient-append-suffix 'magit-dispatch "!"
+          '("@" "Agent notes" agent-notes-menu)))
+    (error (message "agent-notes: could not extend `magit-dispatch': %s"
+                    (error-message-string err))))
+  (if (memq 'magit-insert-untracked-files (default-value 'magit-status-sections-hook))
+      (magit-add-section-hook 'magit-status-sections-hook
+                              #'agent-notes-insert-status-section
+                              'magit-insert-untracked-files)
+    (magit-add-section-hook 'magit-status-sections-hook
+                            #'agent-notes-insert-status-section nil t)))
+
+(with-eval-after-load 'magit
+  (agent-notes--magit-setup))
 
 (provide 'agent-notes)
 ;;; agent-notes.el ends here
