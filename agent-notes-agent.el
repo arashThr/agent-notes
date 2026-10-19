@@ -17,6 +17,9 @@
 (require 'agent-notes-log)
 
 (declare-function agent-notes--get-buffer "agent-notes" (file))
+(declare-function treesit-parser-list "treesit.c" (&optional buffer language tag))
+(declare-function treesit-buffer-root-node "treesit" (&optional language tag))
+(declare-function treesit-node-check "treesit.c" (node property))
 
 (defvar-local agent-notes--ticker nil
   "Timer that updates the elapsed time while the agent works.")
@@ -46,8 +49,10 @@ To comment on the change as a whole rather than a line, use \"path\": \"\" and \
             "You cannot modify files in this session: when the user asks for a change, "
             "describe it and show the code instead.\n")))
 
-(defun agent-notes--context-prompt ()
-  "Return the part of the prompt describing the review."
+(defun agent-notes--context-prompt (&optional include-diff)
+  "Return the part of the prompt describing the review.
+It lists the changed files.  If INCLUDE-DIFF, it also has the diff
+when it is small enough; see `agent-notes-inline-diff-limit'."
   (let* ((review agent-notes--review)
          (base-rev (plist-get review :base_rev)))
     (concat
@@ -65,7 +70,50 @@ To comment on the change as a whole rather than a line, use \"path\": \"\" and \
      ".\nThe exact unified diff under review, which all line numbers refer to, is saved at:\n  "
      (agent-notes--diff-file agent-notes--file) "\n"
      "The review itself is stored in " (file-name-directory agent-notes--file) ".\n"
-     (agent-notes--permissions-prompt))))
+     (agent-notes--permissions-prompt)
+     "\n" (agent-notes--files-prompt)
+     (if include-diff (agent-notes--diff-prompt) ""))))
+
+(defun agent-notes--files-prompt ()
+  "Return the list of changed files with the size of their changes."
+  (let ((files (agent-notes--file-tree agent-notes--records)))
+    (if (null files)
+        "The diff is empty.\n"
+      (concat
+       (format "Changed files (%s):\n" (agent-notes--diff-stats agent-notes--records))
+       (mapconcat
+        (lambda (file)
+          (let* ((rec (car file))
+                 (status (plist-get rec :status))
+                 (lines (apply #'append (mapcar #'cdr (cdr file)))))
+            (format "- %s  +%d -%d%s\n" (plist-get rec :path)
+                    (cl-count 'added lines :key (lambda (r) (plist-get r :kind)))
+                    (cl-count 'removed lines :key (lambda (r) (plist-get r :kind)))
+                    (cond ((plist-get rec :from)
+                           (format " (renamed from %s)" (plist-get rec :from)))
+                          ((equal status "modified") "")
+                          (t (format " (%s)" status))))))
+        files "")))))
+
+(defun agent-notes--fence-for (text)
+  "Return a code fence of backticks that does not occur in TEXT."
+  (let ((fence "```"))
+    (while (string-match-p (concat "^[ \t+-]*" (regexp-quote fence)) text)
+      (setq fence (concat fence "`")))
+    fence))
+
+(defun agent-notes--diff-prompt ()
+  "Return the diff for the prompt, or how to read it if it is large."
+  (let ((diff (string-trim-right (or (agent-notes--stored-diff) ""))))
+    (if (and agent-notes-inline-diff-limit
+             (<= (length diff) agent-notes-inline-diff-limit))
+        (let ((fence (agent-notes--fence-for diff)))
+          (concat "\nThe full diff (the same as the diff file):\n"
+                  fence "diff\n" diff "\n" fence "\n"))
+      (format "\nThe diff is large (%d lines), so it is not included here.  Read the \
+diff file in parts until you have read all of it, and do not skip any of the \
+files listed above.\n"
+              (1+ (cl-count ?\n diff))))))
 
 (defun agent-notes--json-instructions (example)
   "Return the instructions for the final JSON block, showing EXAMPLE."
@@ -104,8 +152,9 @@ To comment on the change as a whole rather than a line, use \"path\": \"\" and \
 (defun agent-notes--task-prompt (task)
   "Return the prompt asking the agent to do TASK, a (NAME . INSTRUCTIONS)."
   (concat
-   (agent-notes--context-prompt)
-   "\nRead the diff file first. Your task:\n" (cdr task) "\n"
+   (agent-notes--context-prompt t)
+   "\nBefore you start, read the whole diff, and open the changed files wherever "
+   "you need more context than the diff shows. Your task:\n" (cdr task) "\n"
    (if agent-notes-extra-instructions
        (concat "\nAdditional instructions from the user:\n" agent-notes-extra-instructions "\n")
      "")
@@ -119,6 +168,41 @@ To comment on the change as a whole rather than a line, use \"path\": \"\" and \
     (concat "{\"summary\": \"...\",\n"
             " \"notes\": [{\"path\": \"src/example.py\", \"line\": 42, \"side\": \"new\", "
             "\"severity\": \"warning\", \"body\": \"...\"}]}"))))
+
+(defun agent-notes--hunk-excerpt (rec)
+  "Return the code around the diff line REC in its hunk, as text.
+Up to `agent-notes-thread-context-lines' lines before and after REC
+are included, each with its old and new line numbers; REC's line is
+marked with >>.  Return nil if REC is not a line of the diff."
+  (let* ((records (vconcat agent-notes--records))
+         (i (cl-position rec records :test #'eq)))
+    (when i
+      (cl-flet ((code-p (j) (memq (plist-get (aref records j) :kind)
+                                  '(context added removed meta))))
+        (let ((start i)
+              (end i)
+              (radius (max 0 agent-notes-thread-context-lines)))
+          (while (and (> start 0) (code-p (1- start))) (cl-decf start))
+          (while (and (< (1+ end) (length records)) (code-p (1+ end))) (cl-incf end))
+          (let ((from (max start (- i radius)))
+                (to (min end (+ i radius)))
+                (header (and (> start 0) (aref records (1- start)))))
+            (concat
+             "The thread's line in the diff (marked >>), with the old and new line numbers:\n"
+             (if (eq (plist-get header :kind) 'hunk)
+                 (concat "   " (plist-get header :text) "\n")
+               "")
+             (if (> from start) "   ...\n" "")
+             (mapconcat
+              (lambda (j)
+                (let* ((r (aref records j))
+                       (kind (plist-get r :kind)))
+                  (format "%s %5s %5s %s\n" (if (= j i) ">>" "  ")
+                          (if (memq kind '(added meta)) "" (plist-get r :old))
+                          (if (memq kind '(removed meta)) "" (plist-get r :new))
+                          (plist-get r :text))))
+              (number-sequence from to) "")
+             (if (< to end) "   ...\n" ""))))))))
 
 (defun agent-notes--format-thread (note new-ids)
   "Return NOTE as text for the agent; comments in NEW-IDS are marked NEW."
@@ -137,7 +221,8 @@ To comment on the change as a whole rather than a line, use \"path\": \"\" and \
      (cond ((plist-get note :outdated)
             (format "The code this thread was about has changed; it was: %s\n"
                     (plist-get note :text)))
-           (rec (format "Diff line: %s\n" (plist-get rec :text)))
+           (rec (or (agent-notes--hunk-excerpt rec)
+                    (format "Diff line: %s\n" (plist-get rec :text))))
            (t ""))
      (let ((suggestion (plist-get note :suggestion)))
        (if (not (stringp suggestion))

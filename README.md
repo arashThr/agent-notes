@@ -74,12 +74,12 @@ Press `?` (or `h`) for a menu with all of these.
 | `l`             | Jump to any note, resolved ones included, from a list                                                               |
 | `TAB`           | Fold the file, hunk or note at point. Resolved notes start folded.                                                  |
 | `^`, `1`–`4`    | Parent section, show levels (as in Magit)                                                                           |
-| `v`             | Switch between unified and side-by-side views                                                                       |
+| `v`             | Switch between unified and side-by-side views. Side by side, notes sit in the column of the side they are on.       |
 | `#`             | Show / hide line numbers                                                                                            |
 | `c`             | New note on the line at point. In the side-by-side view, the side at point counts. Elsewhere, write a general note. |
-| `r`             | Reply to the note at point                                                                                          |
+| `r`             | Resolve / reopen the note at point                                                                                  |
 | `e` / `k`       | Edit / delete your unsent comment (or your whole unsent note)                                                       |
-| `R`             | Resolve / reopen the note at point                                                                                  |
+| `R`             | Reply to the note at point                                                                                          |
 | `a`             | Apply the change suggested in the note at point                                                                     |
 | `s`             | Send all unsent comments to the agent                                                                               |
 | `A`             | Give the agent a task                                                                                               |
@@ -134,6 +134,13 @@ When every note is resolved and nothing is unsent, the review says so, and the M
 
 - **Storage.** Every review is stored in `.git/agent-notes/<id>.json`, with a snapshot of the diff in `<id>.diff`. Nothing is committed. Git never pushes anything inside `.git/`, so reviews stay on your machine: other clones don't see them, and each clone or worktree has its own.
 - **Sessions.** Each review has its own Copilot session (`copilot --session-id <uuid>`), so the agent remembers the review when you reply.
+- **Context.** Every prompt gives the repository, the scope (base commit), the path of the diff snapshot, and the list of changed files with their `+`/`-` counts.
+  - **Tasks** also include the whole diff, if it is under `agent-notes-inline-diff-limit` characters (40000, about 10k tokens). That way no part of it gets skimmed. Larger diffs are left for the agent to read in parts, and it is told not to skip any file.
+  - **Replies** include each thread with new messages, together with the code around it from the hunk: up to `agent-notes-thread-context-lines` lines on each side, with old and new line numbers.
+  - **Files.** In both cases the agent can open whole files for more context.
+
+  The log (`$`) shows every prompt in full.
+
 - **Permissions.** Copilot runs non-interactively (`copilot -p`) and may:
   - read files and run the read-only commands in `agent-notes-allowed-tools`;
   - edit files (`--allow-tool=write`) when `agent-notes-allow-edits` is non-nil, which is the default. It is told to change code only when you ask.
@@ -149,6 +156,8 @@ When every note is resolved and nothing is unsent, the review says so, and the M
 
 - `agent-notes-tasks`: the tasks offered when giving the agent work
 - `agent-notes-extra-instructions`: guidance added to every task, such as the project's conventions
+- `agent-notes-inline-diff-limit`: the largest diff (in characters) put in a task's prompt; `nil` never includes it
+- `agent-notes-thread-context-lines`: lines of code shown around each thread when replying
 - `agent-notes-allow-edits`: whether the agent may edit files
 - `agent-notes-default-view`: `unified` or `split`
 - `agent-notes-show-line-numbers`: whether new reviews show line numbers

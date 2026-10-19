@@ -586,10 +586,10 @@ own instructions."
     ("l" "Jump to any note…" agent-notes-list)]
    ["Notes"
     ("c" "New note" agent-notes-new-note)
-    ("r" "Reply" agent-notes-reply)
+    ("R" "Reply" agent-notes-reply)
     ("e" "Edit unsent comment" agent-notes-edit)
     ("k" "Delete unsent comment" agent-notes-delete)
-    ("R" "Resolve / reopen" agent-notes-toggle-resolved)
+    ("r" "Resolve / reopen" agent-notes-toggle-resolved)
     ("a" "Apply suggested change" agent-notes-apply-suggestion)]
    ["Agent"
     ("s" "Send unsent comments" agent-notes-send)
@@ -629,10 +629,10 @@ own instructions."
   "}" #'agent-notes-next-file
   "{" #'agent-notes-previous-file
   "c" #'agent-notes-new-note
-  "r" #'agent-notes-reply
+  "R" #'agent-notes-reply
   "e" #'agent-notes-edit
   "k" #'agent-notes-delete
-  "R" #'agent-notes-toggle-resolved
+  "r" #'agent-notes-toggle-resolved
   "a" #'agent-notes-apply-suggestion
   "s" #'agent-notes-send
   "l" #'agent-notes-list

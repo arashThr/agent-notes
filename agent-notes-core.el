@@ -128,6 +128,20 @@ the format for notes; INSTRUCTIONS say what to do with them."
 (define-obsolete-variable-alias 'agent-notes-review-instructions
   'agent-notes-extra-instructions "0.2.0")
 
+(defcustom agent-notes-inline-diff-limit 40000
+  "Largest diff, in characters, that is put in the prompt of a task.
+The agent always gets the list of changed files and the path of the
+diff; a diff up to this size is also included in full, so the
+agent cannot skip parts of it.  Larger diffs, about 4 characters per
+token, are left for the agent to read.  nil never includes the diff."
+  :type '(choice (const :tag "Never" nil) integer))
+
+(defcustom agent-notes-thread-context-lines 8
+  "Lines of the diff shown around a thread's line when replying.
+When you send comments, each thread is given to the agent with up
+to this many lines of its hunk before and after its line."
+  :type 'integer)
+
 (defcustom agent-notes-extra-instructions nil
   "Extra instructions added to every task, or nil.
 For example, the conventions of your project."

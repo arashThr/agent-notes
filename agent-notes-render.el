@@ -88,26 +88,31 @@ SYNTAX is as in `agent-notes--code-line'."
   "Return non-nil if LINE opens or closes a fenced code block."
   (string-prefix-p "```" (string-trim-left line)))
 
+(defun agent-notes--faces (&rest faces)
+  "Return FACES as a list for `font-lock-face', without nil and `default'.
+The face `default' specifies every attribute, so in a list it would
+hide the background of the faces after it, such as the note's."
+  (cl-remove-if (lambda (face) (memq face '(nil default))) (flatten-tree faces)))
+
 (defun agent-notes--fontify-line (line in-fence base &optional plain)
   "Return LINE of Markdown with faces; IN-FENCE means inside a code block.
-BASE is the face for ordinary text.  Unless PLAIN, add the note
-background."
-  (let ((bg (unless plain '(agent-notes-note))))
+BASE is the face for ordinary text, or nil.  Unless PLAIN, add the
+note background."
+  (let ((bg (unless plain 'agent-notes-note)))
     (cond
      ((agent-notes--fence-p line)
-      (propertize line 'font-lock-face (cons 'agent-notes-border bg)))
+      (propertize line 'font-lock-face (agent-notes--faces 'agent-notes-border bg)))
      (in-fence
-      (propertize line 'font-lock-face (append (list 'agent-notes-code-block base) bg)))
+      (propertize line 'font-lock-face (agent-notes--faces 'agent-notes-code-block base bg)))
      (t
-      (let ((s (propertize line 'font-lock-face (cons base bg)))
+      (let ((s (propertize line 'font-lock-face (agent-notes--faces base bg)))
             (start 0))
         (while (string-match "`[^`]+`\\|\\*\\*[^*]+\\*\\*" s start)
           (put-text-property (match-beginning 0) (match-end 0) 'font-lock-face
-                             (append (list (if (eq (aref s (match-beginning 0)) ?`)
-                                               'agent-notes-code
-                                             'bold)
-                                           base)
-                                     bg)
+                             (agent-notes--faces (if (eq (aref s (match-beginning 0)) ?`)
+                                                     'agent-notes-code
+                                                   'bold)
+                                                 base bg)
                              s)
           (setq start (match-end 0)))
         s)))))
@@ -151,6 +156,10 @@ blocks are shown as images when possible."
 
 (defvar agent-notes--diagram-cache (make-hash-table :test #'equal)
   "Rendered diagrams: md5 of the color and source, to SVG or `failed'.")
+
+(defvar agent-notes--text-width nil
+  "When non-nil, the width available for the text being inserted.
+Bound while inserting a note in one column of the side-by-side view.")
 
 (defun agent-notes--dot-fence-p (line)
   "Return non-nil if LINE opens a Graphviz code block."
@@ -206,15 +215,19 @@ PLAIN and FENCE-WIDTH are as in `agent-notes--insert-markdown'."
          (svg (and images (agent-notes--render-dot source)))
          (start (point)))
     (if svg
-        (insert pad
-                (propertize " " 'display
-                            (create-image svg 'svg t
-                                          :ascent 'center
-                                          :max-width
-                                          (* (max 20 (- (or agent-notes--width 80)
-                                                        (string-width pad)))
-                                             (frame-char-width))))
-                "\n")
+        (let ((bg (unless plain 'agent-notes-note)))
+          (insert pad
+                  (propertize " "
+                              'font-lock-face bg
+                              'display
+                              (create-image svg 'svg t
+                                            :ascent 'center
+                                            :max-width
+                                            (* (max 20 (- (or agent-notes--text-width
+                                                              agent-notes--width 80)
+                                                          (string-width pad)))
+                                               (frame-char-width))))
+                  (propertize "\n" 'font-lock-face bg)))
       (insert pad (agent-notes--fontify-line open nil base plain) "\n")
       (dolist (line lines)
         (insert pad (agent-notes--fontify-line
@@ -270,19 +283,88 @@ PLAIN and FENCE-WIDTH are as in `agent-notes--insert-markdown'."
           (dolist (line (agent-notes--suggestion-lines path suggestion 'added))
             (insert pad border line "\n")))))))
 
+(defun agent-notes--note-column (note)
+  "Return the column of the side-by-side view that shows NOTE, or nil.
+A note on a diff line is shown in the column of its side, `left' or
+`right'; other notes, and all notes in the unified view, span the
+whole width."
+  (let ((rec (and agent-notes--placement
+                  (gethash (plist-get note :id) agent-notes--placement))))
+    (when (and (eq agent-notes--view 'split)
+               (memq (plist-get rec :kind) '(added removed context)))
+      (if (equal (plist-get note :side) "old") 'left 'right))))
+
+(defun agent-notes--continuation (line)
+  "Return the start of the note LINE, to repeat on the lines it wraps to."
+  (string-match "\\` *│? *" line)
+  (substring line 0 (match-end 0)))
+
+(defun agent-notes--wrap-string (string width cont)
+  "Split STRING into lines at most WIDTH columns wide, breaking at spaces.
+The lines after the first start with CONT."
+  (when (>= (string-width cont) (/ width 2))
+    (setq cont ""))
+  (let ((lines nil))
+    (while (> (string-width string) width)
+      (let* ((fit (max 1 (length (truncate-string-to-width string width))))
+             (space (cl-position ?\s string :end fit :from-end t))
+             (cut (if (and space (> space (length cont))) space fit)))
+        (push (substring string 0 cut) lines)
+        (setq string (concat cont (string-trim-left (substring string cut) " +")))))
+    (nreverse (cons string lines))))
+
+(defun agent-notes--columnize (beg end column &optional truncate)
+  "Lay out the lines from BEG to END in COLUMN of the side-by-side view.
+COLUMN is `left' or `right'.  Lines wider than the column are
+wrapped at spaces, or cut if TRUNCATE.  Each line gets the note
+background up to the edge of the column, and the separator between
+the columns continues next to it."
+  (let* ((half agent-notes--half)
+         (separator (propertize "│" 'font-lock-face 'agent-notes-border))
+         (before (if (eq column 'right) (concat (make-string half ?\s) separator) ""))
+         (after (if (eq column 'left) separator ""))
+         (fill (propertize " " 'font-lock-face 'agent-notes-note
+                           'display `(space :align-to ,(if (eq column 'left)
+                                                           half
+                                                         (+ half 1 half)))))
+         (end (copy-marker end)))
+    (save-excursion
+      (goto-char beg)
+      (while (< (point) end)
+        (let* ((lbeg (point))
+               (line (buffer-substring lbeg (line-end-position)))
+               (props (and (> (length line) 0)
+                           (cl-loop for prop in '(agent-notes-comment agent-notes-diagram)
+                                    for value = (get-text-property 0 prop line)
+                                    when value append (list prop value)))))
+          (delete-region lbeg (line-end-position))
+          (insert (mapconcat (lambda (piece) (concat before piece fill after))
+                             (if truncate
+                                 (list (truncate-string-to-width line half nil nil "…"))
+                               (agent-notes--wrap-string line half
+                                                         (agent-notes--continuation line)))
+                             "\n"))
+          (when props (add-text-properties lbeg (point) props))
+          ;; Keep the note's background out of the other column.
+          (put-text-property (point) (min (1+ (point)) (point-max)) 'font-lock-face nil)
+          (forward-line 1))))
+    (set-marker end nil)))
+
 (defun agent-notes--insert-note (note)
   "Insert NOTE as a section at point."
   (let* ((id (plist-get note :id))
          (comments (plist-get note :comments))
          (resolved (agent-notes--resolved-p note))
-         (base (if resolved 'agent-notes-resolved 'default))
+         (base (and resolved 'agent-notes-resolved))
          (severity (or (plist-get note :severity) ""))
          (unsent (cl-count-if #'agent-notes--pending-p comments))
-         (pad agent-notes--pad)
+         (column (agent-notes--note-column note))
+         (pad (if column " " agent-notes--pad))
+         (agent-notes--text-width (and column (- agent-notes--half 2)))
          (start (point)))
     (cl-flet ((ins (string &rest faces)
                 (insert (propertize string 'font-lock-face
-                                    (append faces '(agent-notes-note)))))
+                                    (agent-notes--faces faces 'agent-notes-note))))
               (state-label (comment)
                 (cond ((memq (plist-get comment :id) agent-notes--in-flight) "  sending…")
                       ((agent-notes--pending-p comment) "  unsent")
@@ -314,9 +396,12 @@ PLAIN and FENCE-WIDTH are as in `agent-notes--insert-markdown'."
           (ins (format "  · %s · " (agent-notes--plural (length comments) "comment")) 'shadow)
           (ins (agent-notes--first-line note 50) base))
         (ins "\n")
+        (when column
+          (agent-notes--columnize start (point) column t))
         (magit-insert-heading)
         ;; Body: the comments.
-        (let ((first t))
+        (let ((first t)
+              (body (point)))
           (dolist (comment comments)
             (let ((cstart (point))
                   (border (propertize (concat "│ " (if first "" "  "))
@@ -339,11 +424,13 @@ PLAIN and FENCE-WIDTH are as in `agent-notes--insert-markdown'."
               (agent-notes--insert-markdown (plist-get comment :body) base
                                             (concat pad border))
               (put-text-property cstart (point) 'agent-notes-comment (plist-get comment :id))
-              (setq first nil))))
-        (agent-notes--insert-suggestion note pad)
-        (insert pad)
-        (ins "└" 'agent-notes-border)
-        (ins "\n")
+              (setq first nil)))
+          (agent-notes--insert-suggestion note pad)
+          (insert pad)
+          (ins "└" 'agent-notes-border)
+          (ins "\n")
+          (when column
+            (agent-notes--columnize body (point) column)))
         (put-text-property start (point) 'agent-notes-note id)
         (put-text-property start (point) 'wrap-prefix
                            (concat pad (propertize "│   " 'face '(agent-notes-border
@@ -539,7 +626,7 @@ point.  SYNTAX is as in `agent-notes--code-line'."
                   "\n")
           (magit-insert-heading)
           (let ((start (point)))
-            (agent-notes--insert-markdown (plist-get summary :text) 'default "  " t
+            (agent-notes--insert-markdown (plist-get summary :text) nil "  " t
                                           (max 20 (- (or agent-notes--width 80) 3)))
             (put-text-property start (point) 'wrap-prefix "  "))))
       (insert (propertize (substitute-command-keys

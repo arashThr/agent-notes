@@ -219,8 +219,52 @@ REVIEW-EXTRA is a plist merged into the stored review."
     ;; Both notes are below that row.
     (should (equal (plist-get (agent-notes-tests--line-before-note 1) :kind) 'removed))
     (should (eql (save-excursion (forward-line 1) (get-text-property (point) 'agent-notes-note)) 1))
+    ;; Each note sits in the column of its side, and long text wraps in it.
+    (cl-flet ((note-lines (id)
+                (let ((section (agent-notes--note-section id)))
+                  (split-string (buffer-substring-no-properties (oref section start)
+                                                                (1- (oref section end)))
+                                "\n"))))
+      (let ((half agent-notes--half))
+        (dolist (line (note-lines 1))
+          (should (string-suffix-p "│" line))
+          (should (<= (string-width line) (+ half 2))))
+        (dolist (line (note-lines 2))
+          (should (string-prefix-p (concat (make-string half ?\s) "│") line))
+          (should (<= (string-width line) (+ half 2 half))))))
+    (agent-notes-tests--add-comment 2 (mapconcat #'identity (make-list 40 "word") " "))
+    (agent-notes--render)
+    (let ((section (agent-notes--note-section 2)))
+      (should (string-search "word word" (buffer-substring (oref section start) (oref section end))))
+      (dolist (line (split-string (buffer-substring-no-properties (oref section start)
+                                                                  (1- (oref section end)))
+                                  "\n"))
+        ;; The fill is one space that is displayed up to the column's edge.
+        (should (<= (string-width line) (+ agent-notes--half 2 agent-notes--half)))))
     (agent-notes-toggle-view)
     (should (eq agent-notes--view 'unified))))
+
+(defun agent-notes-tests--add-comment (id body)
+  "Add an unsent comment BODY to the note ID."
+  (let ((note (agent-notes--note id)))
+    (plist-put note :comments (append (plist-get note :comments)
+                                      (list (agent-notes--make-comment "you" body "pending"))))))
+
+(ert-deftest agent-notes-test-note-faces-keep-background ()
+  (agent-notes-tests--with-review nil
+    (agent-notes--apply-review
+     '(:notes ((:path "src/auth.py" :line 11 :side "new" :severity "info"
+                :body "Text with `code` and **bold**.")))
+     "Review")
+    (agent-notes--render)
+    (let ((section (agent-notes--note-section 1)))
+      (cl-loop for pos from (oref section start) below (oref section end)
+               for faces = (ensure-list (get-text-property pos 'font-lock-face))
+               do (should-not (memq 'default faces))))))
+
+(ert-deftest agent-notes-test-keys ()
+  (should (eq (keymap-lookup agent-notes-mode-map "r") #'agent-notes-toggle-resolved))
+  (should (eq (keymap-lookup agent-notes-mode-map "R") #'agent-notes-reply)))
 
 (ert-deftest agent-notes-test-reanchor ()
   (agent-notes-tests--with-review nil
@@ -281,6 +325,36 @@ REVIEW-EXTRA is a plist merged into the stored review."
       (should (string-search "```text" (agent-notes--task-prompt '("Mine" . "x"))))
       (should-not (string-search "```dot" (agent-notes--task-prompt '("Mine" . "x")))))
     (should (string-search "\"original\"" (agent-notes--task-prompt '("Mine" . "x"))))))
+
+(ert-deftest agent-notes-test-prompt-context ()
+  (agent-notes-tests--with-review nil
+    ;; Tasks get the changed files and, when small, the whole diff.
+    (let ((prompt (agent-notes--task-prompt '("Mine" . "x"))))
+      (should (string-search "Changed files (2 files, +3 −1):" prompt))
+      (should (string-search "- src/auth.py  +2 -1\n" prompt))
+      (should (string-search "- new.txt  +1 -0 (added)\n" prompt))
+      (should (string-search "```diff\ndiff --git a/src/auth.py" prompt))
+      (should (string-search "+hello\n```\n" prompt)))
+    (let* ((agent-notes-inline-diff-limit 10)
+           (prompt (agent-notes--task-prompt '("Mine" . "x"))))
+      (should-not (string-search "```diff" prompt))
+      (should (string-search "The diff is large" prompt)))
+    (should (equal (agent-notes--fence-for "+```elisp\n") "````"))
+    ;; Replies get the files, the code around each thread, but not the diff.
+    (agent-notes--apply-review
+     '(:notes ((:path "src/auth.py" :line 11 :side "new" :body "Why?"))) "Review")
+    (let ((prompt (agent-notes--reply-prompt (agent-notes--notes) nil)))
+      (should (string-search "Changed files" prompt))
+      (should-not (string-search "```diff" prompt))
+      (should (string-search "   @@ -10,4 +10,5 @@ def login(user):\n" prompt))
+      (should (string-search "      10    10      token = make_token(user)\n" prompt))
+      (should (string-search "      11       -    log(token)\n" prompt))
+      (should (string-search ">>          11 +    if user.disabled:\n" prompt))
+      (should (string-search "      12    13      return token\n" prompt)))
+    (let* ((agent-notes-thread-context-lines 1)
+           (prompt (agent-notes--reply-prompt (agent-notes--notes) nil)))
+      (should (string-search "   ...\n      11       -" prompt))
+      (should (string-search "return None\n   ...\n" prompt)))))
 
 (ert-deftest agent-notes-test-general-note ()
   (agent-notes-tests--with-review nil
