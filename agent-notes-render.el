@@ -296,6 +296,36 @@ whole width."
                (memq (plist-get rec :kind) '(added removed context)))
       (if (equal (plist-get note :side) "old") 'left 'right))))
 
+(defun agent-notes--pane-range (&optional pane)
+  "Return (PANE START END) of a side-by-side pane on the current line.
+The text of each column, in code rows and in notes, has the
+property `agent-notes-pane', `left' or `right'.  PANE defaults to
+the pane point is in or at the end of.  Return nil if there is none."
+  (let* ((bol (line-beginning-position))
+         (eol (line-end-position))
+         (pane (or pane
+                   (get-text-property (point) 'agent-notes-pane)
+                   (and (> (point) bol) (get-text-property (1- (point)) 'agent-notes-pane))))
+         (start (and pane (text-property-any bol eol 'agent-notes-pane pane))))
+    (when start
+      (list pane start (or (text-property-not-all start eol 'agent-notes-pane pane) eol)))))
+
+(defun agent-notes--pane-start (&optional pos)
+  "Return where the text of the line at POS (default point) begins.
+This is the start of the first pane on the line: after the empty
+left half for a note in the right column.  On a line without
+panes, it is the beginning of the line."
+  (save-excursion
+    (goto-char (or pos (point)))
+    (let* ((bol (line-beginning-position))
+           (eol (line-end-position))
+           (start (if (get-text-property bol 'agent-notes-pane)
+                      bol
+                    (next-single-property-change bol 'agent-notes-pane nil eol))))
+      (if (and start (< start eol) (get-text-property start 'agent-notes-pane))
+          start
+        bol))))
+
 (defun agent-notes--continuation (line)
   "Return the start of the note LINE, to repeat on the lines it wraps to."
   (string-match "\\` *│? *" line)
@@ -323,7 +353,9 @@ background up to the edge of the column, and the separator between
 the columns continues next to it."
   (let* ((half agent-notes--half)
          (separator (propertize "│" 'font-lock-face 'agent-notes-border))
-         (before (if (eq column 'right) (concat (make-string half ?\s) separator) ""))
+         (before (if (eq column 'right)
+                     (concat (make-string half ?\s) separator)
+                   ""))
          (after (if (eq column 'left) separator ""))
          (fill (propertize " " 'font-lock-face 'agent-notes-note
                            'display `(space :align-to ,(if (eq column 'left)
@@ -340,7 +372,12 @@ the columns continues next to it."
                                     for value = (get-text-property 0 prop line)
                                     when value append (list prop value)))))
           (delete-region lbeg (line-end-position))
-          (insert (mapconcat (lambda (piece) (concat before piece fill after))
+          ;; The text of the column is marked, so that the cursor can stay in it;
+          ;; see `agent-notes--pane-range'.
+          (insert (mapconcat (lambda (piece)
+                               (concat before
+                                       (propertize (concat piece fill) 'agent-notes-pane column)
+                                       after))
                              (if truncate
                                  (list (truncate-string-to-width line half nil nil "…"))
                                (agent-notes--wrap-string line half
@@ -528,10 +565,13 @@ point.  SYNTAX is as in `agent-notes--code-line'."
   (let ((start (point)))
     (insert (agent-notes--split-cell left :old syntax))
     (put-text-property start (point) 'agent-notes-loc (or left right))
+    (put-text-property start (point) 'agent-notes-pane 'left)
     (setq start (point))
-    (insert (propertize "│" 'font-lock-face 'agent-notes-border)
-            (agent-notes--split-cell right :new syntax)
-            "\n")
+    (insert (propertize "│" 'font-lock-face 'agent-notes-border))
+    (let ((cell (point)))
+      (insert (agent-notes--split-cell right :new syntax))
+      (put-text-property cell (point) 'agent-notes-pane 'right))
+    (insert "\n")
     (put-text-property start (point) 'agent-notes-loc (or right left))))
 
 ;;;; Files and hunks

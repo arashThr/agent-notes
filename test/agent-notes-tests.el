@@ -12,6 +12,9 @@
 (require 'ert)
 (require 'agent-notes)
 
+;; Tests that run a fake agent must not pop up real notifications.
+(setq agent-notes-notify nil)
+
 (defconst agent-notes-tests--diff
   "diff --git a/src/auth.py b/src/auth.py
 index 1111111..2222222 100644
@@ -409,6 +412,65 @@ REVIEW-EXTRA is a plist merged into the stored review."
   "Return the faces at POS as a list."
   (ensure-list (get-text-property pos 'font-lock-face)))
 
+(ert-deftest agent-notes-test-cursor-stays-in-note-column ()
+  (agent-notes-tests--with-review nil
+    (agent-notes--apply-review
+     '(:notes ((:path "src/auth.py" :line 11 :side "new" :severity "info"
+                :body "First line\n\nSecond line")
+               (:path "src/auth.py" :line 11 :side "old" :severity "info" :body "Old")))
+     "Review")
+    (agent-notes-toggle-view)
+    (let ((right (1+ agent-notes--half)))
+      ;; A note on the right starts after the empty left half.
+      (agent-notes--goto-note 1)
+      (should (= (current-column) right))
+      (should (= (point) (agent-notes--pane-start)))
+      ;; Jumping with n lands in the same place, for both columns.
+      (goto-char (point-min))
+      (let ((columns (list (progn (agent-notes-next-note) (current-column))
+                           (progn (agent-notes-next-note) (current-column)))))
+        (should (equal (sort columns #'<) (list 0 right))))
+      ;; Moving past the end of a line stays in the column, and back.
+      (agent-notes--goto-note 1)
+      (end-of-line)
+      (let ((line (line-number-at-pos)))
+        (agent-notes-forward-char)
+        (should (= (line-number-at-pos) (1+ line)))
+        (should (= (current-column) right))
+        (agent-notes-backward-char)
+        (should (= (line-number-at-pos) line))
+        (should (eolp)))
+      (agent-notes-beginning-of-line)
+      (should (= (current-column) right))
+      ;; A note on the left starts at the edge, as usual.
+      (agent-notes--goto-note 2)
+      (should (= (current-column) 0))
+      (end-of-line)
+      (agent-notes-forward-char)
+      (should (= (current-column) 0)))))
+
+(defvar agent-notes-tests--recentered nil
+  "The row `recenter' was last asked for in a test.")
+
+(ert-deftest agent-notes-test-note-is-centered ()
+  (agent-notes-tests--with-review nil
+    (agent-notes--apply-review
+     '(:notes ((:path "src/auth.py" :line 12 :side "new" :body "A")))
+     "Review")
+    (agent-notes--render)
+    (save-window-excursion
+      (set-window-buffer (selected-window) (current-buffer))
+      (cl-letf (((symbol-function 'recenter)
+                 (lambda (row &rest _) (setq agent-notes-tests--recentered row))))
+        (setq agent-notes-tests--recentered nil)
+        (goto-char (point-min))
+        (agent-notes-next-note)
+        (should (natnump agent-notes-tests--recentered))
+        (setq agent-notes-tests--recentered nil)
+        (let ((agent-notes-center-on-note nil))
+          (agent-notes-next-note)
+          (should-not agent-notes-tests--recentered))))))
+
 (ert-deftest agent-notes-test-syntax-highlighting ()
   (agent-notes-tests--with-review nil
     (dolist (view '(unified split))
@@ -715,6 +777,103 @@ It runs SHELL, prints ANSWER and ignores its arguments."
         (should (equal (plist-get last :stage) "Failed"))
         (should (string-search "code 3" (plist-get last :text)))
         (should (string-search "not signed in" (plist-get last :text)))))))
+
+(ert-deftest agent-notes-test-cursor-stays-in-code-column ()
+  (agent-notes-tests--with-review nil
+    (agent-notes-toggle-view)
+    (let ((right (1+ agent-notes--half)))
+      ;; Right column: the end of the text, then on to the next row's right half.
+      (goto-char (point-min))
+      (search-forward "+    if user.disabled:")
+      (agent-notes-end-of-line)
+      (should (eolp))
+      (let ((line (line-number-at-pos)))
+        (agent-notes-forward-char)
+        (should (= (line-number-at-pos) (1+ line)))
+        (should (= (current-column) right))
+        (should (looking-at " *[0-9]* *\\+ +return None"))
+        (agent-notes-backward-char)
+        (should (= (line-number-at-pos) line))
+        (should (eolp))
+        (agent-notes-beginning-of-line)
+        (should (= (current-column) right)))
+      ;; Left column: stays left, at the edge of its half.
+      (goto-char (point-min))
+      (search-forward "token = make_token(user)")
+      (agent-notes-end-of-line)
+      (should (= (current-column) agent-notes--half))
+      (let ((line (line-number-at-pos)))
+        (agent-notes-forward-char)
+        (should (= (line-number-at-pos) (1+ line)))
+        (should (= (current-column) 0))
+        (should (looking-at " *[0-9]* *-    log(token)"))
+        (agent-notes-backward-char)
+        (should (= (line-number-at-pos) line))
+        (should (= (current-column) agent-notes--half))
+        (agent-notes-beginning-of-line)
+        (should (= (current-column) 0)))
+      ;; Inside the text, the keys are plain.
+      (search-forward "make")
+      (agent-notes-forward-char)
+      (agent-notes-backward-char)
+      (should (looking-at "_token")))))
+
+(ert-deftest agent-notes-test-notify-default-macos ()
+  (let ((system-type 'darwin)
+        (agent-notes--bundle-id "org.example.Emacs")
+        (installed nil)
+        (calls nil))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (program &rest _) (and (member program installed) program)))
+              ((symbol-function 'agent-notes--run-notifier)
+               (lambda (program &rest args) (push (cons program args) calls) 0)))
+      ;; terminal-notifier: clicking brings Emacs to the front.
+      (setq installed '("terminal-notifier" "osascript"))
+      (agent-notes-notify-default "Title" "Body")
+      (should (equal (caar calls) "terminal-notifier"))
+      (should (member "org.example.Emacs" (car calls)))
+      (should (member "-activate" (car calls)))
+      ;; Otherwise osascript, with the text as arguments.
+      (setq installed '("osascript") calls nil)
+      (agent-notes-notify-default "Title" "Body \"quoted\"")
+      (should (equal (caar calls) "osascript"))
+      (should (equal (last (car calls) 2) '("Title" "Body \"quoted\""))))))
+
+(ert-deftest agent-notes-test-notification ()
+  (agent-notes-tests--with-repo
+    (let* ((sent nil)
+           (agent-notes-notify 'always)
+           (agent-notes-notify-function (lambda (title body) (push (list title body) sent)))
+           (agent-notes-copilot-program
+            (agent-notes-tests--fake-agent
+             tmp "```json\n{\"summary\": \"ok\", \"notes\": []}\n```")))
+      (cl-flet ((run ()
+                  (setq sent nil)
+                  (agent-notes--start-task (assoc "Overview" agent-notes-tasks))
+                  (agent-notes-tests--wait)))
+        (run)
+        (should (= (length sent) 1))
+        (should (equal (car (car sent)) "Agent Notes: Overview done"))
+        (should (string-search "Copilot answered after" (cadr (car sent))))
+        (let ((agent-notes-notify nil))
+          (run)
+          (should-not sent))
+        (let ((agent-notes-notify 'unfocused))
+          (cl-letf (((symbol-function 'agent-notes--emacs-focused-p) (lambda () t)))
+            (run)
+            (should-not sent))
+          (cl-letf (((symbol-function 'agent-notes--emacs-focused-p) (lambda () nil)))
+            (run)
+            (should (= (length sent) 1))))
+        ;; Failures are announced too; a broken notifier is not an error.
+        (let ((agent-notes-copilot-program (expand-file-name "failing-copilot" tmp)))
+          (agent-notes--write-file agent-notes-copilot-program "#!/bin/sh\nexit 3\n")
+          (set-file-modes agent-notes-copilot-program #o755)
+          (run)
+          (should (equal (car (car sent)) "Agent Notes: Overview failed"))
+          (let ((agent-notes-notify-function (lambda (_title _body) (error "No bus"))))
+            (run)
+            (should-not agent-notes--status)))))))
 
 ;;;; Diff sources
 

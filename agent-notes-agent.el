@@ -730,6 +730,68 @@ are not in its diff; see them in Magit."
              (and (not (string-blank-p text)) text))
       (delete-file output-file))))
 
+(declare-function notifications-notify "notifications" (&rest params))
+
+(defvar agent-notes--bundle-id nil
+  "The macOS bundle identifier of the running Emacs, once found.")
+
+(defun agent-notes--macos-bundle-id ()
+  "Return the macOS bundle identifier of the running Emacs."
+  (or agent-notes--bundle-id
+      (setq agent-notes--bundle-id
+            (or (ignore-errors
+                  (let ((plist (expand-file-name "../Info" invocation-directory)))
+                    (and (file-exists-p (concat plist ".plist"))
+                         (with-temp-buffer
+                           (call-process "defaults" nil t nil "read" plist "CFBundleIdentifier")
+                           (let ((id (string-trim (buffer-string))))
+                             (and (string-match-p "\\`[[:alnum:].-]+\\'" id) id))))))
+                "org.gnu.Emacs"))))
+
+(defun agent-notes--run-notifier (program &rest args)
+  "Run the notification PROGRAM with ARGS, without waiting for it."
+  (apply #'call-process program nil 0 nil args))
+
+(defun agent-notes-notify-default (title body)
+  "Show a desktop notification with TITLE and BODY.
+On macOS, use `terminal-notifier' when it is installed, because
+clicking its notification brings Emacs to the front.  Without it,
+use `osascript', whose notifications open Script Editor when clicked.
+Elsewhere use D-Bus (`notifications-notify') where it is available."
+  (cond
+   ((and (eq system-type 'darwin) (executable-find "terminal-notifier"))
+    (agent-notes--run-notifier "terminal-notifier"
+                               "-title" title "-message" body
+                               "-activate" (agent-notes--macos-bundle-id)
+                               "-group" "agent-notes"))
+   ((and (eq system-type 'darwin) (executable-find "osascript"))
+    ;; The text goes in as arguments, so it needs no quoting.
+    (agent-notes--run-notifier "osascript"
+                               "-e" "on run {t, b}"
+                               "-e" "display notification b with title t"
+                               "-e" "end run"
+                               title body))
+   ((and (featurep 'dbusbind) (require 'notifications nil t))
+    (notifications-notify :title title :body body :app-name "Emacs"))))
+
+(defun agent-notes--emacs-focused-p ()
+  "Return non-nil if one of the Emacs frames has the focus."
+  (cl-some (lambda (frame) (eq (frame-focus-state frame) t)) (frame-list)))
+
+(defun agent-notes--notify (title body)
+  "Notify the user that TITLE happened, with the details BODY.
+See `agent-notes-notify'.  A notification that cannot be sent is
+never an error."
+  (when (and agent-notes-notify
+             (or (eq agent-notes-notify 'always)
+                 (not (agent-notes--emacs-focused-p))))
+    (condition-case err
+        (funcall agent-notes-notify-function title
+                 (truncate-string-to-width
+                  (replace-regexp-in-string "[ \t\n]+" " " body) 200 nil nil "…"))
+      (error (message "Agent Notes: could not send a notification: %s"
+                      (error-message-string err))))))
+
 (defun agent-notes--sentinel (proc file label on-success in-flight before
                                    &optional agent output-file)
   "Handle the end of the agent PROC for the review FILE.
@@ -772,20 +834,31 @@ that ran, and OUTPUT-FILE the file of its answer, if any."
             (error (agent-notes--log "Failed" (format "Could not check whether files changed: %s"
                                                       (error-message-string err)))))
           (if (not ok)
-              (message "Agent Notes: %s %s%s (press $ for the log)" label
-                       (if aborted "aborted" "failed")
-                       (if changes (concat "; " changes) ""))
+              (progn
+                (message "Agent Notes: %s %s%s (press $ for the log)" label
+                         (if aborted "aborted" "failed")
+                         (if changes (concat "; " changes) ""))
+                (unless aborted
+                  (agent-notes--notify
+                   (format "Agent Notes: %s failed" label)
+                   (format "%s exited with code %s; see the log." name code))))
             (condition-case err
                 (let ((result (funcall on-success (agent-notes--extract-json answer) in-flight)))
                   (agent-notes--save)
                   (agent-notes--log "Applied" (or result "Applied the answer."))
-                  (message "Agent Notes: %s done%s" label (if changes (concat "; " changes) "")))
+                  (message "Agent Notes: %s done%s" label (if changes (concat "; " changes) ""))
+                  (agent-notes--notify
+                   (format "Agent Notes: %s done" label)
+                   (format "%s answered after %s. %s" name elapsed (or result ""))))
               (error
                (agent-notes--log "Failed" (format "Could not use the agent's answer: %s.  \
 Your comments stay unsent; you can send them again."
                                                   (error-message-string err)))
                (message "Agent Notes: %s failed: %s (press $ for the log)"
-                        label (error-message-string err)))))
+                        label (error-message-string err))
+               (agent-notes--notify
+                (format "Agent Notes: %s failed" label)
+                (format "Could not use the answer: %s" (error-message-string err))))))
           (agent-notes--render))))))
 
 ;;;; Suggested changes

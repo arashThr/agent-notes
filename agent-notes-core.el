@@ -17,6 +17,8 @@
 (require 'subr-x)
 (require 'json)
 
+(declare-function agent-notes-notify-default "agent-notes-agent" (title body))
+
 ;;;; Customization
 
 (defgroup agent-notes nil
@@ -179,6 +181,25 @@ to this many lines of its hunk before and after its line."
   "Extra instructions added to every task, or nil.
 For example, the conventions of your project."
   :type '(choice (const :tag "None" nil) string))
+
+(defcustom agent-notes-notify 'always
+  "When to send a notification once the agent has finished a request.
+The notification comes from `agent-notes-notify-function'.
+`always': every time; `unfocused': only when no Emacs frame has the
+focus, so not while you are looking at it; nil: never."
+  :type '(choice (const :tag "Always" always)
+                 (const :tag "When Emacs is not in front" unfocused)
+                 (const :tag "Never" nil)))
+
+(defcustom agent-notes-notify-function #'agent-notes-notify-default
+  "Function that shows a notification, called with a title and a text.
+The default uses `terminal-notifier' or `osascript' on macOS and
+D-Bus elsewhere."
+  :type 'function)
+
+(defcustom agent-notes-center-on-note t
+  "When non-nil, jumping to a note puts it in the middle of the window."
+  :type 'boolean)
 
 (defcustom agent-notes-magit-status-section t
   "When non-nil, show the latest review in the Magit status buffer."

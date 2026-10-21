@@ -224,12 +224,25 @@ When done, call CALLBACK with the text in the review buffer."
 ;;;; Navigation
 
 (defun agent-notes--goto-section (section)
-  "Move point to SECTION, unfolding the sections that contain it."
+  "Move point to SECTION, unfolding the sections that contain it.
+Point goes to the start of the text, which for a note in the right
+column of the side-by-side view is not the start of the line."
   (let ((parent (oref section parent)))
     (when parent (magit-section-reveal parent)))
   (goto-char (oref section start))
+  (goto-char (agent-notes--pane-start))
   (let ((win (get-buffer-window (current-buffer))))
     (when win (set-window-point win (point)))))
+
+(defun agent-notes--center (section)
+  "Scroll the window so that SECTION is in the middle of it.
+A section taller than the window is put at the top.  See
+`agent-notes-center-on-note'."
+  (let ((win (get-buffer-window (current-buffer))))
+    (when (and agent-notes-center-on-note win)
+      (with-selected-window win
+        (let ((lines (count-screen-lines (oref section start) (oref section end) nil win)))
+          (recenter (max 0 (/ (- (window-body-height win) lines) 2))))))))
 
 (defun agent-notes--goto-note (id &optional comment-id)
   "Move point to the note ID, or to its comment COMMENT-ID."
@@ -240,9 +253,65 @@ When done, call CALLBACK with the text in the review buffer."
         (magit-section-show section)
         (let ((pos (agent-notes--find-prop 'agent-notes-comment comment-id)))
           (when pos
-            (goto-char pos)
+            (goto-char (agent-notes--pane-start pos))
             (let ((win (get-buffer-window (current-buffer))))
-              (when win (set-window-point win pos)))))))))
+              (when win (set-window-point win (point))))))))))
+
+(defun agent-notes--goto-adjacent-pane (pane direction)
+  "Move into PANE on the next line, or the previous if DIRECTION is -1.
+Point goes to the start of the pane going down, and to its end going
+up.  Return non-nil if there was such a pane to move to."
+  (let ((pos (save-excursion
+               (when (zerop (forward-line direction))
+                 (pcase (agent-notes--pane-range pane)
+                   (`(,_ ,start ,end) (if (> direction 0) start end)))))))
+    (when pos (goto-char pos))))
+
+(defun agent-notes-forward-char (&optional n)
+  "Like `forward-char' for N characters, but stay in the pane.
+In the side-by-side view, at the end of the text of one column
+go to the start of the same column on the next line, rather than
+into the other column."
+  (interactive "^p")
+  (let* ((n (or n 1))
+         (range (and (= n 1) (agent-notes--pane-range))))
+    (unless (and range
+                 (= (point) (nth 2 range))
+                 (agent-notes--goto-adjacent-pane (car range) 1))
+      (forward-char n))))
+
+(defun agent-notes-backward-char (&optional n)
+  "Like `backward-char' for N characters, but stay in the pane.
+In the side-by-side view, at the start of the text of one column
+go to the end of the same column on the previous line, rather than
+into the other column."
+  (interactive "^p")
+  (let* ((n (or n 1))
+         (range (and (= n 1) (agent-notes--pane-range))))
+    (unless (and range
+                 (= (point) (nth 1 range))
+                 (agent-notes--goto-adjacent-pane (car range) -1))
+      (backward-char n))))
+
+(defun agent-notes-beginning-of-line (&optional n)
+  "Like `move-beginning-of-line' with argument N, but stay in the pane.
+In the side-by-side view, go to the start of the text of the column
+at point rather than of the line."
+  (interactive "^p")
+  (let ((range (and (or (null n) (= n 1)) (agent-notes--pane-range))))
+    (if range
+        (goto-char (nth 1 range))
+      (move-beginning-of-line n))))
+
+(defun agent-notes-end-of-line (&optional n)
+  "Like `move-end-of-line' with argument N, but stay in the pane.
+In the side-by-side view, go to the end of the text of the column
+at point rather than of the line."
+  (interactive "^p")
+  (let ((range (and (or (null n) (= n 1)) (agent-notes--pane-range))))
+    (if range
+        (goto-char (nth 2 range))
+      (move-end-of-line n))))
 
 (defun agent-notes--jump (type forward what &optional pred hint)
   "Move to the next section of TYPE; backward unless FORWARD.
@@ -260,6 +329,7 @@ added to the error when there are none."
       (message "Wrapped around"))
     (agent-notes--goto-section target)
     (when (eq type 'agent-notes-note)
+      (agent-notes--center target)
       (message "Note #%d (%d of %d %s)" (oref target value)
                (1+ (cl-position target targets)) (length targets) what))))
 
@@ -665,6 +735,12 @@ session with AGENT."
 (defvar-keymap agent-notes-mode-map
   :doc "Keymap for `agent-notes-mode'."
   :parent magit-section-mode-map
+  "<remap> <forward-char>" #'agent-notes-forward-char
+  "<remap> <right-char>" #'agent-notes-forward-char
+  "<remap> <backward-char>" #'agent-notes-backward-char
+  "<remap> <left-char>" #'agent-notes-backward-char
+  "<remap> <move-beginning-of-line>" #'agent-notes-beginning-of-line
+  "<remap> <move-end-of-line>" #'agent-notes-end-of-line
   "n" #'agent-notes-next-note
   "p" #'agent-notes-previous-note
   "N" #'agent-notes-next-agent-note

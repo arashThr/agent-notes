@@ -93,7 +93,7 @@ Press `?` (or `h`) for a menu with all of these.
 
 | Key             | Action                                                                                                              |
 | --------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `n` / `p`       | Next / previous open note. Resolved notes are skipped; with `C-u`, they are included.                               |
+| `n` / `p`       | Next / previous open note, centered in the window. Resolved notes are skipped; with `C-u`, they are included.       |
 | `N` / `P`       | Next / previous open note written by the agent                                                                      |
 | `M-n` / `M-p`   | Next / previous hunk, across files                                                                                  |
 | `}` / `{`       | Next / previous file                                                                                                |
@@ -116,6 +116,8 @@ Press `?` (or `h`) for a menu with all of these.
 | `x` / `C-c C-k` | Abort the running agent request                                                                                     |
 
 In the compose buffer, `C-c C-c` saves and `C-c C-k` cancels.
+
+Side by side, the cursor stays in its column. `C-f` / right-arrow at the end of the text of a column goes to the start of the same column on the next line, `C-b` / left-arrow at its start goes to the end of the previous line, and `C-a` / `C-e` go to the start / end of the column, not of the whole line. This holds for code and for notes, and `n` / `p` put the cursor at the start of a note's text.
 
 ### Editing code during a review
 
@@ -140,6 +142,10 @@ If [Graphviz](https://graphviz.org) is installed (`brew install graphviz`), the 
 ### When you are done
 
 When every note is resolved and nothing is unsent, the review says so, and the Magit status line shows "all resolved ✓". Commit as usual with Magit. The review stays in `.git/agent-notes/` as history and can be reopened with `o` in the menu. For the next round of changes, start a new review.
+
+### Notifications
+
+When the agent finishes a request, or fails, you get a desktop notification, so you can do something else while it works. On macOS, install [terminal-notifier](https://github.com/julienXX/terminal-notifier) (`brew install terminal-notifier`): clicking its notification brings Emacs to the front. Without it, the notification comes from `osascript`, which shows it under Script Editor, so clicking it opens Script Editor instead of Emacs. Elsewhere it uses D-Bus. Set `agent-notes-notify` to `unfocused` to be notified only when Emacs is not in front, or to `nil` to turn it off. `agent-notes-notify-function` replaces how the notification is shown.
 
 ### The log
 
@@ -188,6 +194,8 @@ When every note is resolved and nothing is unsent, the review says so, and the M
 - `agent-notes-allow-edits`: whether the agent may edit files
 - `agent-notes-default-view`: `unified` or `split`
 - `agent-notes-show-line-numbers`: whether new reviews show line numbers
+- `agent-notes-notify`: `always`, `unfocused` or `nil`, when to send a notification at the end of a request
+- `agent-notes-center-on-note`: whether `n`/`p` center the note in the window
 - `agent-notes-syntax-highlighting`: highlight code with the file's major mode (mode hooks are not run, so no language server starts). The faces `agent-notes-added-bg` and `agent-notes-removed-bg` set the backgrounds.
 - `agent-notes-refresh-on-save`: refresh reviews when you save a file of the repository
 - `agent-notes-agent`: `copilot`, `claude` or `codex`
