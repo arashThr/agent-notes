@@ -145,6 +145,33 @@ REVIEW-EXTRA is a plist merged into the stored review."
     (forward-line -1)
     (get-text-property (point) 'agent-notes-loc)))
 
+(ert-deftest agent-notes-test-hunk-title-and-pinned-file ()
+  (should (equal (agent-notes--hunk-title "@@ -10,4 +10,5 @@ def login(user):")
+                 "@@ def login(user):"))
+  (should (equal (agent-notes--hunk-title "@@ -0,0 +1 @@") "@@ line 1"))
+  (agent-notes-tests--with-review nil
+    (agent-notes--render)
+    (should (string-search "@@ def login(user):" (buffer-string)))
+    (should-not (string-search "-10,4" (buffer-string)))
+    ;; The header line names the file the cursor is in.
+    (goto-char (point-min))
+    (agent-notes--update-current-path)
+    (should-not agent-notes--current-path)
+    (search-forward "if user.disabled")
+    (agent-notes--update-current-path)
+    (should (equal agent-notes--current-path "src/auth.py"))
+    (should (string-prefix-p " src/auth.py  ·  " (agent-notes--header-line)))
+    (search-forward "hello")
+    (agent-notes--update-current-path)
+    (should (equal agent-notes--current-path "new.txt"))))
+
+(ert-deftest agent-notes-test-header-shows-chosen-agent ()
+  (agent-notes-tests--with-review nil
+    (let ((agent-notes-agent 'copilot))
+      (should (string-search "Copilot" (agent-notes--header-line)))
+      (agent-notes-choose-agent 'claude)
+      (should (string-search "Claude Code" (agent-notes--header-line))))))
+
 (ert-deftest agent-notes-test-review-roundtrip-and-render ()
   (agent-notes-tests--with-review nil
     (agent-notes--apply-review

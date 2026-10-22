@@ -723,6 +723,7 @@ session with AGENT."
                                         nil t nil nil current)
                        candidates)))))
   (setq agent-notes-agent agent)
+  (force-mode-line-update t)
   (message "Agent Notes now uses %s" (agent-notes--agent-name)))
 
 (defun agent-notes--choose-agent-description ()
@@ -841,6 +842,7 @@ all with \\[agent-notes-send].  Press \\[agent-notes-dispatch] for a menu of all
   (setq agent-notes--view agent-notes-default-view
         agent-notes--line-numbers agent-notes-show-line-numbers)
   (add-hook 'window-size-change-functions #'agent-notes--on-window-size-change nil t)
+  (add-hook 'post-command-hook #'agent-notes--update-current-path nil t)
   (add-hook 'kill-buffer-hook #'agent-notes--cleanup nil t)
   (add-hook 'after-save-hook #'agent-notes--after-save))
 

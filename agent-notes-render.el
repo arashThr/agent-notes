@@ -580,6 +580,18 @@ point.  SYNTAX is as in `agent-notes--code-line'."
 
 ;;;; Files and hunks
 
+(defun agent-notes--hunk-title (text)
+  "Return the title shown for the hunk header TEXT.
+It keeps the code context git puts after the line numbers, such as the
+function name, and drops the numbers, which the line-number gutter
+already shows.  A hunk without context is titled by its first line."
+  (if (string-match "\\`@@ -[0-9,]+ \\+\\([0-9]+\\)\\(?:,[0-9]+\\)? @@ ?\\(.*\\)" text)
+      (let ((context (string-trim (match-string 2 text))))
+        (if (string-empty-p context)
+            (format "@@ line %s" (match-string 1 text))
+          (concat "@@ " context)))
+    text))
+
 (defun agent-notes--insert-hunk (hunk by-record)
   "Insert HUNK, a (HUNK-REC . LINES), with the notes from BY-RECORD."
   (let* ((rec (car hunk))
@@ -587,7 +599,7 @@ point.  SYNTAX is as in `agent-notes--code-line'."
          (syntax (agent-notes--hunk-syntax (plist-get rec :path) lines)))
     (magit-insert-section (agent-notes-hunk (cons (plist-get rec :path) (plist-get rec :text)))
       (let ((start (point)))
-        (insert (propertize (concat (plist-get rec :text) "\n")
+        (insert (propertize (concat (agent-notes--hunk-title (plist-get rec :text)) "\n")
                             'font-lock-face 'agent-notes-hunk-header))
         (put-text-property start (point) 'agent-notes-loc rec))
       (magit-insert-heading)
@@ -682,13 +694,36 @@ point.  SYNTAX is as in `agent-notes--code-line'."
                           'font-lock-face 'shadow))
       (insert "\n"))))
 
+(defvar-local agent-notes--current-path nil
+  "The file the cursor is in, shown in the header line.")
+
+(defun agent-notes--path-at (pos)
+  "Return the path of the file section containing POS, or nil."
+  (let ((section (and magit-root-section (magit-section-at pos))))
+    (while (and section (not (eq (oref section type) 'agent-notes-file)))
+      (setq section (oref section parent)))
+    (and section (oref section value))))
+
+(defun agent-notes--update-current-path ()
+  "Update the file name in the header line after the cursor moved."
+  (let ((path (ignore-errors (agent-notes--path-at (point)))))
+    (unless (equal path agent-notes--current-path)
+      (setq agent-notes--current-path path)
+      (force-mode-line-update))))
+
 (defun agent-notes--header-line ()
-  "Return the header line of the review buffer."
+  "Return the header line of the review buffer.
+It starts with the file the cursor is in, so you can tell which file
+a change belongs to however far you have scrolled."
   (when agent-notes--review
     (let* ((notes (agent-notes--notes))
            (resolved (cl-count-if #'agent-notes--resolved-p notes))
            (unsent (length (agent-notes--pending-comments))))
-      (concat " " (agent-notes--scope-label agent-notes--review)
+      (concat " "
+              (if agent-notes--current-path
+                  (concat (propertize agent-notes--current-path 'face 'bold) "  ·  ")
+                "")
+              (agent-notes--scope-label agent-notes--review)
               (if (agent-notes--all-resolved-p)
                   (propertize (format "  ·  all %d resolved" resolved) 'face 'success)
                 (format "  ·  %d open, %d resolved" (- (length notes) resolved) resolved))

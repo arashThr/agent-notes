@@ -6,7 +6,7 @@ The diff is shown in a Magit-style buffer, unified or side by side, with the syn
 
 ```
 stats.py
-@@ -3,3 +3,8 @@ def average(xs):
+@@ def average(xs):
     5     5      return total / len(xs)
           8 +def median(xs):
           9 +    s = sorted(xs)
@@ -76,7 +76,7 @@ You can also pick "Custom instructions…" or type your own text, for example "e
 
 ### Choosing the agent
 
-Set `agent-notes-agent` to `copilot` (the default), `claude` or `codex`. You can also switch for the current Emacs session with `@` in a review, or `a` in `agent-notes-menu`. The header line shows the agent in use ("Claude Code: idle").
+Set `agent-notes-agent` to `copilot` (the default), `claude` or `codex`. You can also switch for the current Emacs session with `@` in a review, or `a` in `agent-notes-menu`. The header line shows the agent that will run the next request ("Claude Code: idle"). It also shows the file the cursor is in, in bold, so you always know which file you are looking at. Hunk headings show only the surrounding function or class, without line numbers or counts.
 
 Each review remembers its session with an agent. If you switch agents in the middle of a review, the next request starts a new session with the new agent, and the log says so. The new agent doesn't remember earlier requests. Replies still work well, because each one includes its whole thread and the code around it.
 
