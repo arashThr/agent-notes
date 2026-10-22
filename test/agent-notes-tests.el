@@ -1068,5 +1068,249 @@ It runs SHELL, prints ANSWER and ignores its arguments."
         ;; The session survives reopening the review.
         (should (string-search "\"agent\": \"codex\"" (agent-notes--read-file agent-notes--file)))))))
 
+;;;; Posting to GitHub
+
+(defvar agent-notes-tests--gh-calls nil
+  "The arguments of the calls to the stubbed `agent-notes--gh', newest first.")
+
+(defun agent-notes-tests--pr-json (oid &optional number)
+  "Return the JSON `gh pr view' prints for the pull request NUMBER at OID."
+  (format "{\"number\":%d,\"url\":\"https://github.com/o/r/pull/%d\",\"title\":\"T\",\"headRefOid\":\"%s\"}"
+          (or number 3) (or number 3) oid))
+
+(defmacro agent-notes-tests--with-gh (handler &rest body)
+  "Run BODY with `agent-notes--gh' replaced by HANDLER, called with its ARGS.
+Handler returns (CODE OUT ERR).  The calls are in
+`agent-notes-tests--gh-calls'."
+  (declare (indent 1))
+  `(let ((agent-notes-tests--gh-calls nil))
+     (cl-letf (((symbol-function 'agent-notes--gh)
+                (lambda (args)
+                  (push args agent-notes-tests--gh-calls)
+                  (pcase-let ((`(,code ,out ,err) (funcall ,handler args)))
+                    (list :code code :out (or out "") :err (or err ""))))))
+       ,@body)))
+
+(defun agent-notes-tests--head ()
+  "Return the commit id of HEAD in the current repository."
+  (string-trim (agent-notes--git "rev-parse" "HEAD")))
+
+(defun agent-notes-tests--github-notes ()
+  "Add notes on the repository to try posting: #1 on a context line, #2
+on an added line, #3 on a removed line and #4 a general note."
+  (agent-notes--apply-review
+   '(:notes ((:path "src/auth.py" :line 10 :side "new" :body "Name it")
+             (:path "src/auth.py" :line 11 :side "new" :body "Added")
+             (:path "src/auth.py" :line 11 :side "old" :body "Removed")))
+   "Review")
+  (agent-notes--add-note "you" "" "new" 0 "" "Overall" "pending")
+  (agent-notes--render))
+
+(ert-deftest agent-notes-test-github-plan ()
+  (agent-notes-tests--with-repo
+    (agent-notes-tests--github-notes)
+    (let ((pr (list :number 3 :url "https://github.com/o/r/pull/3"
+                    :headRefOid (agent-notes-tests--head))))
+      ;; Only the context line is the same in the pull request's commit.
+      (should (equal (agent-notes--gh-plan (agent-notes--note 1) pr) '(:line 10)))
+      (should (string-search "differs" (plist-get (agent-notes--gh-plan (agent-notes--note 2) pr)
+                                                  :reason)))
+      (should (string-search "removed" (plist-get (agent-notes--gh-plan (agent-notes--note 3) pr)
+                                                  :reason)))
+      (should-not (agent-notes--gh-plan (agent-notes--note 4) pr))
+      (should (string-search "does not have this file"
+                             (plist-get (agent-notes--gh-plan
+                                         (agent-notes--note 1)
+                                         (plist-put (copy-sequence pr) :headRefOid
+                                                    (make-string 40 ?0)))
+                                        :reason)))
+      (should (string-search "inline on src/auth.py:10"
+                             (agent-notes--gh-describe-plan (agent-notes--note 1) pr '(:line 10))))
+      (should (string-search "general comment, because the"
+                             (agent-notes--gh-describe-plan
+                              (agent-notes--note 2) pr '(:reason "the code differs")))))))
+
+(ert-deftest agent-notes-test-github-post ()
+  (agent-notes-tests--with-repo
+    (agent-notes-tests--github-notes)
+    (let ((pr (list :number 3 :url "https://github.com/o/r/pull/3" :headRefOid "abc123"))
+          (text "It's \"odd\"; $HOME `x`\nsecond line"))
+      ;; A comment on the line: every value is a separate argument.
+      (agent-notes-tests--with-gh (lambda (_) '(0 "https://github.com/o/r/pull/3#r1\n"))
+        (should (equal (agent-notes--gh-post (agent-notes--note 1) pr '(:line 10) text)
+                       '("https://github.com/o/r/pull/3#r1" . t)))
+        (should (equal (car agent-notes-tests--gh-calls)
+                       `("api" "--method" "POST" "repos/o/r/pulls/3/comments"
+                         "-f" ,(concat "body=" text) "-f" "commit_id=abc123"
+                         "-f" "path=src/auth.py" "-F" "line=10" "-f" "side=RIGHT"
+                         "--jq" ".html_url"))))
+      ;; A general comment quotes the code.
+      (agent-notes-tests--with-gh (lambda (_) '(0 "https://github.com/o/r/pull/3#c2\n"))
+        (should (equal (agent-notes--gh-post (agent-notes--note 2) pr '(:reason "x") "Added")
+                       '("https://github.com/o/r/pull/3#c2" . nil)))
+        (let ((args (car agent-notes-tests--gh-calls)))
+          (should (equal (seq-take args 4)
+                         '("pr" "comment" "https://github.com/o/r/pull/3" "--body")))
+          (should (string-prefix-p "`src/auth.py:11`\n" (nth 4 args)))
+          (should (string-search "```\n    if user.disabled:\n```" (nth 4 args)))
+          (should (string-suffix-p "\n\nAdded" (nth 4 args)))))
+      ;; A general note is posted as it is.
+      (agent-notes-tests--with-gh (lambda (_) '(0 ""))
+        (should (equal (agent-notes--gh-post (agent-notes--note 4) pr nil "Overall")
+                       '("https://github.com/o/r/pull/3" . nil)))
+        (should (equal (nth 4 (car agent-notes-tests--gh-calls)) "Overall")))
+      ;; Other hosts need --hostname.
+      (should (member "--hostname"
+                      (agent-notes--gh-inline-args
+                       (agent-notes--note 1)
+                       (list :number 3 :url "https://git.example.com/o/r/pull/3" :headRefOid "a")
+                       "x")))
+      (should-not (member "--hostname" (agent-notes--gh-inline-args (agent-notes--note 1) pr "x"))))))
+
+(ert-deftest agent-notes-test-github-inline-refused ()
+  (agent-notes-tests--with-repo
+    (agent-notes-tests--github-notes)
+    (let ((pr (list :number 3 :url "https://github.com/o/r/pull/3" :headRefOid "abc123"))
+          (asked nil))
+      (agent-notes-tests--with-gh (lambda (args)
+                                    (if (equal (car args) "api")
+                                        '(1 "{}" "gh: Validation Failed (HTTP 422)\nmore")
+                                      '(0 "https://github.com/o/r/pull/3#c3\n")))
+        ;; Declined: nothing else is posted.
+        (cl-letf (((symbol-function 'y-or-n-p) (lambda (prompt) (setq asked prompt) nil)))
+          (should-error (agent-notes--gh-post (agent-notes--note 1) pr '(:line 10) "x")
+                        :type 'user-error))
+        (should (string-search "Validation Failed (HTTP 422))" asked))
+        (should (= (length agent-notes-tests--gh-calls) 1))
+        ;; Accepted: it becomes a general comment.
+        (cl-letf (((symbol-function 'y-or-n-p) (lambda (_) t)))
+          (should (equal (agent-notes--gh-post (agent-notes--note 1) pr '(:line 10) "x")
+                         '("https://github.com/o/r/pull/3#c3" . nil))))
+        (should (equal (seq-take (car agent-notes-tests--gh-calls) 2) '("pr" "comment")))))))
+
+(ert-deftest agent-notes-test-github-resolve-pr ()
+  (agent-notes-tests--with-repo
+    (let ((oid (agent-notes-tests--head))
+          (asked nil))
+      ;; The pull request of the current branch is not remembered.
+      (agent-notes-tests--with-gh (lambda (_) `(0 ,(agent-notes-tests--pr-json oid)))
+        (should (= (plist-get (agent-notes--gh-resolve-pr nil) :number) 3))
+        (should (equal (car agent-notes-tests--gh-calls)
+                       '("pr" "view" "--json" "number,url,title,headRefOid")))
+        (should-not (plist-get agent-notes--review :pr)))
+      ;; Without one, you are asked, and it is remembered.
+      (agent-notes-tests--with-gh (lambda (args)
+                                    (if (member "7" args)
+                                        `(0 ,(agent-notes-tests--pr-json oid 7))
+                                      '(1 "" "no pull requests found for branch \"x\"")))
+        (cl-letf (((symbol-function 'read-string)
+                   (lambda (prompt &rest _) (setq asked prompt) "7")))
+          (should (= (plist-get (agent-notes--gh-resolve-pr nil) :number) 7)))
+        (should (string-search "No pull request for the current branch" asked))
+        (should (equal (plist-get agent-notes--review :pr) "https://github.com/o/r/pull/7")))
+      ;; Afterwards the remembered one is used.
+      (agent-notes-tests--with-gh (lambda (_) `(0 ,(agent-notes-tests--pr-json oid 7)))
+        (agent-notes--gh-resolve-pr nil)
+        (should (member "https://github.com/o/r/pull/7" (car agent-notes-tests--gh-calls))))
+      ;; A pull request that does not exist.
+      (agent-notes-tests--with-gh (lambda (_) '(1 "" "not found"))
+        (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "99")))
+          (should-error (agent-notes--gh-resolve-pr t) :type 'user-error)))
+      ;; Not logged in is reported as such, not as a missing pull request.
+      (setq agent-notes--review (plist-put agent-notes--review :pr nil))
+      (agent-notes-tests--with-gh (lambda (_) '(4 "" "To get started with GitHub CLI, please run:  gh auth login"))
+        (let ((err (should-error (agent-notes--gh-resolve-pr nil) :type 'user-error)))
+          (should (string-search "gh auth login" (cadr err))))))))
+
+(ert-deftest agent-notes-test-github-missing-gh ()
+  (let ((agent-notes-gh-program "agent-notes-no-such-program"))
+    (let ((err (should-error (agent-notes--gh '("--version")) :type 'user-error)))
+      (should (string-search "GitHub CLI not found" (cadr err))))))
+
+(ert-deftest agent-notes-test-post-to-github-command ()
+  (agent-notes-tests--with-repo
+    (agent-notes-tests--github-notes)
+    (let ((oid (agent-notes-tests--head))
+          (composed nil)
+          (asked nil))
+      (cl-letf (((symbol-function 'agent-notes--compose)
+                 (lambda (title initial callback)
+                   (setq composed (list title initial))
+                   (funcall callback (concat initial " (edited)")))))
+        (agent-notes-tests--with-gh
+            (lambda (args)
+              (pcase (car args)
+                ("pr" (if (equal (cadr args) "view")
+                         `(0 ,(agent-notes-tests--pr-json oid))
+                       '(0 "https://github.com/o/r/pull/3#c9\n")))
+                ("api" '(0 "https://github.com/o/r/pull/3#r9\n"))))
+          ;; A note whose line is in the pull request.
+          (agent-notes--goto-note 1)
+          (agent-notes-post-to-github)
+          (should (string-search "inline on src/auth.py:10" (car composed)))
+          (should (equal (cadr composed) "Name it"))
+          (should (equal (plist-get (agent-notes--note 1) :github)
+                         "https://github.com/o/r/pull/3#r9"))
+          (should (member "body=Name it (edited)" (car agent-notes-tests--gh-calls)))
+          (should (string-search "on GitHub" (buffer-string)))
+          (should (member "GitHub" (agent-notes-tests--stages)))
+          ;; The same note again asks first.
+          (cl-letf (((symbol-function 'y-or-n-p) (lambda (prompt) (setq asked prompt) nil)))
+            (agent-notes--goto-note 1)
+            (should-error (agent-notes-post-to-github) :type 'user-error)
+            (should (string-search "already on GitHub" asked)))
+          ;; Another note that is not in the pull request becomes a general comment.
+          (agent-notes--goto-note 2)
+          (agent-notes-post-to-github)
+          (should (string-search "general comment, because" (car composed)))
+          (should (equal (plist-get (agent-notes--note 2) :github)
+                         "https://github.com/o/r/pull/3#c9"))
+          (should-not (plist-get (agent-notes--note 3) :github))
+          ;; The record is saved.
+          (should (string-search "#c9" (agent-notes--read-file agent-notes--file))))))))
+
+(ert-deftest agent-notes-test-github-draft-from-agent ()
+  (agent-notes-tests--with-repo
+    (agent-notes-tests--github-notes)
+    (let ((oid (agent-notes-tests--head))
+          (composed nil))
+      ;; Asking the agent to post only makes a draft; nothing is sent to GitHub.
+      (agent-notes-tests--with-gh (lambda (_) '(0 ""))
+        (let ((result (agent-notes--apply-replies
+                       '(:replies ((:note 1 :body "Will do." :github "  `auth.py`: rename this.  ")
+                                   (:note 2 :body "No draft" :github "  ")))
+                       nil)))
+          (should (string-search "drafted 1 GitHub comment" result)))
+        (should-not agent-notes-tests--gh-calls))
+      (should (equal (plist-get (agent-notes--note 1) :github_draft) "`auth.py`: rename this."))
+      (should-not (plist-get (agent-notes--note 2) :github_draft))
+      (agent-notes--render)
+      (should (string-search "GitHub draft: press G" (buffer-string)))
+      ;; G starts from the draft, and posting clears it.
+      (cl-letf (((symbol-function 'agent-notes--compose)
+                 (lambda (title initial callback)
+                   (setq composed (list title initial))
+                   (funcall callback initial))))
+        (agent-notes-tests--with-gh
+            (lambda (args)
+              (if (equal (cadr args) "view")
+                  `(0 ,(agent-notes-tests--pr-json oid))
+                '(0 "https://github.com/o/r/pull/3#r5\n")))
+          (agent-notes--goto-note 1)
+          (agent-notes-post-to-github)
+          (should (string-search "the agent's draft" (car composed)))
+          (should (equal (cadr composed) "`auth.py`: rename this."))
+          (should (member "body=`auth.py`: rename this." (car agent-notes-tests--gh-calls)))))
+      (should-not (plist-get (agent-notes--note 1) :github_draft))
+      (should (plist-get (agent-notes--note 1) :github))
+      (should-not (string-search "GitHub draft" (buffer-string))))))
+
+(ert-deftest agent-notes-test-reply-prompt-github ()
+  (agent-notes-tests--with-repo
+    (agent-notes-tests--github-notes)
+    (let ((prompt (agent-notes--reply-prompt (list (agent-notes--note 1)) '(1))))
+      (should (string-search "\"github\"" prompt))
+      (should (string-search "do NOT run gh" prompt)))))
+
 (provide 'agent-notes-tests)
 ;;; agent-notes-tests.el ends here

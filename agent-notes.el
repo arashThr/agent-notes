@@ -35,7 +35,8 @@
 ;; When you ask it to change code, it edits the files and the diff is
 ;; refreshed, with the notes moving along with the code.  The same
 ;; happens when you edit and save a file yourself.  Press `?' for all
-;; commands and `$' for a log of what happened.
+;; commands and `$' for a log of what happened.  With the GitHub CLI
+;; installed, `G' posts a note to the pull request.
 ;;
 ;; Reviews live in .git/agent-notes/ and are never committed.
 ;;
@@ -45,6 +46,7 @@
 ;; - agent-notes-render.el  drawing the review buffer
 ;; - agent-notes-log.el     the log of a review
 ;; - agent-notes-agent.el   prompts, running the agent, applying answers
+;; - agent-notes-github.el  posting notes to a pull request with `gh'
 ;; - agent-notes-magit.el   Magit integration, loaded with Magit
 ;; - agent-notes.el         the mode, commands, menus and entry points
 
@@ -60,6 +62,7 @@
 (require 'agent-notes-render)
 (require 'agent-notes-log)
 (require 'agent-notes-agent)
+(require 'agent-notes-github)
 
 ;; Introduced in magit-section 4.3.6.
 (defvar magit-section-highlight-current)
@@ -558,6 +561,53 @@ Deleting the first comment of your own note deletes the whole note."
     (agent-notes--save)
     (agent-notes--render)))
 
+(defun agent-notes-post-to-github (&optional choose-pr)
+  "Post the comment at point to a GitHub pull request, with the `gh' CLI.
+When the agent drafted a comment for the note, because you asked it
+to post to GitHub, that draft is the text; otherwise it is the
+comment at point.  You can edit the text first; nothing is posted
+until you finish with \\<agent-notes-compose-mode-map>\\[agent-notes-compose-finish].
+When the note's line is the same in the
+pull request's head commit, the comment goes on that line; otherwise
+it is a general comment that quotes the code.  The pull request is
+the one of the current branch, or the one you chose before in this
+review.  With prefix argument CHOOSE-PR, or when the branch has
+none, you are asked for its number or URL."
+  (interactive "P")
+  (let* ((note (agent-notes--require-note))
+         (id (plist-get note :id)))
+    (when (and (plist-get note :github)
+               (not (plist-get note :github_draft))
+               (not (y-or-n-p (format "Note #%d is already on GitHub (%s).  Post again? "
+                                      id (plist-get note :github)))))
+      (user-error "Not posted"))
+    (let* ((pr (agent-notes--gh-resolve-pr choose-pr))
+           (plan (agent-notes--gh-plan note pr))
+           (cid (get-text-property (point) 'agent-notes-comment))
+           (comments (plist-get note :comments))
+           (comment (or (cl-find cid comments :key (lambda (c) (plist-get c :id)))
+                        (car comments))))
+      (agent-notes--compose
+       (format "Post #%d to GitHub, %s%s" id (agent-notes--gh-describe-plan note pr plan)
+               (if (plist-get note :github_draft) " (the agent's draft)" ""))
+       (or (plist-get note :github_draft) (plist-get comment :body))
+       (lambda (text)
+         (let ((note (or (agent-notes--note id) (user-error "Note #%d no longer exists" id))))
+           (message "Posting to GitHub…")
+           (redisplay)
+           (pcase-let ((`(,url . ,inline) (agent-notes--gh-post note pr plan text)))
+             (plist-put note :github url)
+             (plist-put note :github_draft nil)
+             (agent-notes--save)
+             (agent-notes--log "GitHub"
+                               (format "Posted note #%d to PR #%d as %s: %s"
+                                       id (plist-get pr :number)
+                                       (if inline "a comment on the line" "a general comment")
+                                       url))
+             (agent-notes--render)
+             (agent-notes--goto-note id)
+             (message "Posted to GitHub: %s" url))))))))
+
 (defun agent-notes-toggle-resolved ()
   "Resolve the note at point, or reopen it if it is resolved.
 Resolved notes are folded and skipped by \\[agent-notes-next-note]
@@ -699,7 +749,8 @@ session with AGENT."
     ("e" "Edit unsent comment" agent-notes-edit)
     ("k" "Delete unsent comment" agent-notes-delete)
     ("r" "Resolve / reopen" agent-notes-toggle-resolved)
-    ("a" "Apply suggested change" agent-notes-apply-suggestion)]
+    ("a" "Apply suggested change" agent-notes-apply-suggestion)
+    ("G" "Post to GitHub PR (C-u: choose PR)" agent-notes-post-to-github)]
    ["Agent"
     ("s" "Send unsent comments" agent-notes-send)
     ("A" "Give a task…" agent-notes-request-review)
@@ -755,6 +806,7 @@ session with AGENT."
   "k" #'agent-notes-delete
   "r" #'agent-notes-toggle-resolved
   "a" #'agent-notes-apply-suggestion
+  "G" #'agent-notes-post-to-github
   "s" #'agent-notes-send
   "l" #'agent-notes-list
   "RET" #'agent-notes-visit

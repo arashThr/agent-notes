@@ -23,6 +23,7 @@ Load order follows the dependencies (each file requires the ones above it):
 | `agent-notes-render.el`     | Drawing the review buffer with `magit-section`: unified and side-by-side diffs, note boxes, syntax highlighting                             |
 | `agent-notes-log.el`        | The human-readable activity log buffer                                                                                                      |
 | `agent-notes-agent.el`      | Prompts, building CLI arguments per agent, running the process, parsing answers, applying suggestions, detecting agent edits                |
+| `agent-notes-github.el`     | Posting a note to a pull request with the `gh` CLI (user-initiated only; the command itself is in `agent-notes.el`)                         |
 | `agent-notes-magit.el`      | Magit integration (optional; loaded from Magit buffers)                                                                                     |
 | `agent-notes.el`            | Entry point: major mode, commands, key maps, transient menus                                                                                |
 | `test/agent-notes-tests.el` | ERT tests                                                                                                                                   |
@@ -52,7 +53,7 @@ Strict compile (warnings are errors), then remove the `.elc` files so they
 don't shadow the sources:
 
 ```sh
-/Applications/Emacs.app/Contents/MacOS/Emacs -Q --batch --eval '(progn (setq package-user-dir (expand-file-name "~/.config/emacs/elpa")) (package-initialize))' --eval "(setq byte-compile-error-on-warn t)" -L . -f batch-byte-compile agent-notes-core.el agent-notes-diff.el agent-notes-render.el agent-notes-log.el agent-notes-agent.el agent-notes-magit.el agent-notes.el test/agent-notes-tests.el && echo COMPILE-OK; rm -f *.elc test/*.elc
+/Applications/Emacs.app/Contents/MacOS/Emacs -Q --batch --eval '(progn (setq package-user-dir (expand-file-name "~/.config/emacs/elpa")) (package-initialize))' --eval "(setq byte-compile-error-on-warn t)" -L . -f batch-byte-compile agent-notes-core.el agent-notes-diff.el agent-notes-render.el agent-notes-log.el agent-notes-agent.el agent-notes-github.el agent-notes-magit.el agent-notes.el test/agent-notes-tests.el && echo COMPILE-OK; rm -f *.elc test/*.elc
 ```
 
 Integration (needs a scratch repo with uncommitted changes to `stats.py` and at
@@ -97,3 +98,8 @@ least one review, e.g. `/tmp/an-demo4/`):
   options for the program and extra args, and tests with a fake script.
 - Codex support is untested against the real CLI; Claude Code was checked
   against `claude --help` (2.1.117) but only exercised with a fake script.
+- Posting to GitHub is user-initiated (`G`); the agent only drafts text in a
+  reply's `github` field (`:github_draft`) and never runs `gh`. It goes through `agent-notes--gh`,
+  which takes a list of argv strings (no shell). Tests stub that function; never
+  call the real `gh` against a real pull request. Keep `gh` out of
+  `agent-notes-allowed-tools`.

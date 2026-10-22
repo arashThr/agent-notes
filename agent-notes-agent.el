@@ -294,6 +294,12 @@ marked with >>.  Return nil if REC is not a line of the diff."
    "When a message asks for a suggestion rather than a change, add \"suggestion\" and "
    "\"original\" to your reply instead, with the same meaning as in a note; the user can "
    "then apply it with one key.\n"
+   "When a message asks you to post or leave a comment on GitHub (the pull request), do NOT "
+   "run gh or any other command to do it. Put the comment in \"github\" in your reply: "
+   "the text as it should appear on GitHub, in Markdown. Readers there cannot see this "
+   "thread, so make it self-contained and name the file and the code it is about. The user "
+   "reads and confirms it in Emacs before anything is posted. Use \"github\" only when a "
+   "message asks for it; still answer in \"body\" as usual.\n"
    (agent-notes--diagram-prompt) "\n\n"
    (mapconcat (lambda (note) (agent-notes--format-thread note new-ids)) notes "")
    agent-notes--note-spec "\n\n"
@@ -468,7 +474,7 @@ Return a description of what changed."
       (when (memq (plist-get comment :id) in-flight)
         (plist-put comment :state "sent"))))
   (let ((agent-notes--dropped-suggestions nil)
-        (answered 0) (resolved 0) (suggested 0) (unknown nil))
+        (answered 0) (resolved 0) (suggested 0) (drafted 0) (unknown nil))
     (dolist (reply (plist-get data :replies))
       (let ((note (agent-notes--note (agent-notes--as-int (plist-get reply :note))))
             (body (plist-get reply :body)))
@@ -483,6 +489,10 @@ Return a description of what changed."
                                              (plist-get reply :original)
                                              (plist-get reply :end_line))
             (cl-incf suggested))
+          (let ((github (plist-get reply :github)))
+            (when (and (stringp github) (not (string-blank-p github)))
+              (cl-incf drafted)
+              (plist-put note :github_draft (string-trim github))))
           (when (and (plist-get reply :resolve) (not (agent-notes--resolved-p note)))
             (cl-incf resolved)
             (plist-put note :status "resolved")))))
@@ -490,6 +500,11 @@ Return a description of what changed."
       (concat (format "Answered %s" (agent-notes--plural answered "thread"))
               (if (> resolved 0) (format ", resolved %d" resolved) "")
               (if (> suggested 0) (format ", suggested %s" (agent-notes--plural suggested "change")) "")
+              (if (> drafted 0)
+                  (format ", drafted %s (press G on %s to review and post)"
+                          (agent-notes--plural drafted "GitHub comment")
+                          (if (= drafted 1) "the note" "each note"))
+                "")
               (if added (concat ", " (agent-notes--describe-new-notes added)) "")
               "."
               (if unknown

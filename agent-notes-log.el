@@ -51,7 +51,7 @@ folded under the entry unless SHOW is non-nil."
   "Return the face for log entries of STAGE."
   (pcase stage
     ((or "Failed" "Stopped") 'error)
-    ((or "Done" "Applied") 'success)
+    ((or "Done" "Applied" "GitHub") 'success)
     ("Sent" 'agent-notes-pending)
     ("Changes" 'warning)
     ("You" 'agent-notes-you)

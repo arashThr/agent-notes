@@ -201,6 +201,12 @@ D-Bus elsewhere."
   "When non-nil, jumping to a note puts it in the middle of the window."
   :type 'boolean)
 
+(defcustom agent-notes-gh-program "gh"
+  "The GitHub CLI, used to post notes to a pull request.
+It must be logged in: run `gh auth login' once in a terminal.
+See `agent-notes-post-to-github'."
+  :type 'string)
+
 (defcustom agent-notes-magit-status-section t
   "When non-nil, show the latest review in the Magit status buffer."
   :type 'boolean)

@@ -27,6 +27,7 @@ stats.py
   - the [GitHub Copilot CLI](https://github.com/github/copilot-cli) (`copilot`), the default;
   - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`);
   - or the [OpenAI Codex CLI](https://github.com/openai/codex) (`codex`).
+- Optional, to post notes to GitHub: the [GitHub CLI](https://cli.github.com) (`gh`, `brew install gh`), signed in with `gh auth login`. See [Posting to GitHub](#posting-to-github).
 
 ## Setup
 
@@ -107,6 +108,7 @@ Press `?` (or `h`) for a menu with all of these.
 | `e` / `k`       | Edit / delete your unsent comment (or your whole unsent note)                                                       |
 | `R`             | Reply to the note at point                                                                                          |
 | `a`             | Apply the change suggested in the note at point                                                                     |
+| `G`             | Post the note's comment (or the agent's GitHub draft) to the pull request; `C-u` chooses the pull request           |
 | `s`             | Send all unsent comments to the agent                                                                               |
 | `A`             | Give the agent a task                                                                                               |
 | `@`             | Choose the agent (Copilot, Claude Code, Codex)                                                                      |
@@ -146,6 +148,25 @@ When every note is resolved and nothing is unsent, the review says so, and the M
 ### Notifications
 
 When the agent finishes a request, or fails, you get a desktop notification, so you can do something else while it works. On macOS, install [terminal-notifier](https://github.com/julienXX/terminal-notifier) (`brew install terminal-notifier`): clicking its notification brings Emacs to the front. Without it, the notification comes from `osascript`, which shows it under Script Editor, so clicking it opens Script Editor instead of Emacs. Elsewhere it uses D-Bus. Set `agent-notes-notify` to `unfocused` to be notified only when Emacs is not in front, or to `nil` to turn it off. `agent-notes-notify-function` replaces how the notification is shown.
+
+### Posting to GitHub
+
+After a review you may want a finding to end up on the pull request. There are two ways, and in both you see and confirm the text before anything is posted.
+
+**Ask the agent.** Reply on the note in plain words, for example "post this to GitHub" or "leave a comment about this on the PR", and send it with `s`. The agent doesn't run `gh` itself. It writes the comment as it should appear on GitHub (self-contained, since readers there can't see your thread) and Emacs attaches it to the note as a draft. The note then shows "GitHub draft: press G". Press `G` on it to review the draft, edit it, and post.
+
+**Do it yourself.** Put the cursor on a note (or one of its comments) and press `G`. The compose buffer starts with that comment's text.
+
+Setup: install the GitHub CLI and sign in once with `gh auth login`. If `gh` is missing or not signed in, `G` tells you so. `agent-notes-gh-program` sets the program name.
+
+What `G` does:
+
+1. The pull request is found with `gh pr view`: the one you chose before in this review, else the one of the current branch. If there is none, you are asked for a number or URL, and the choice is remembered in the review. `C-u G` asks first.
+2. A compose buffer opens with the comment's text, which you can edit. Its header line says where it will go. `C-c C-c` posts, `C-c C-k` cancels.
+3. If the note is on a line of the new code, and the pull request's head commit has the same code on that line number, the text is posted as a comment on that line. Otherwise (a general note, a note on removed code, a line that is different or not pushed yet, or a line GitHub refuses) it is posted as a general comment on the pull request, with the file, line and code quoted above your text. The header of the compose buffer says which one it will be and why. GitHub only accepts line comments on lines that are part of the pull request's diff (the changed lines and a few around them); if it refuses, you are asked before it falls back to a general comment.
+4. The note shows "on GitHub", the comment's URL is kept in the review and shown in the echo area and the log, and posting the same note again asks first.
+
+The text is passed to `gh` as separate arguments, with no shell, so quotes and `$` in it are safe. Multi-line comments, and GitHub's "suggestion" blocks, are not special: write a block yourself in the compose buffer if you want one.
 
 ### The log
 
@@ -196,6 +217,7 @@ When the agent finishes a request, or fails, you get a desktop notification, so 
 - `agent-notes-show-line-numbers`: whether new reviews show line numbers
 - `agent-notes-notify`: `always`, `unfocused` or `nil`, when to send a notification at the end of a request
 - `agent-notes-center-on-note`: whether `n`/`p` center the note in the window
+- `agent-notes-gh-program`: the GitHub CLI used by `G`
 - `agent-notes-syntax-highlighting`: highlight code with the file's major mode (mode hooks are not run, so no language server starts). The faces `agent-notes-added-bg` and `agent-notes-removed-bg` set the backgrounds.
 - `agent-notes-refresh-on-save`: refresh reviews when you save a file of the repository
 - `agent-notes-agent`: `copilot`, `claude` or `codex`
@@ -214,6 +236,7 @@ The code is split by concern. Each file requires the ones above it:
 | `agent-notes-render.el` | Drawing the review buffer: header, files, hunks, notes, both views                                               |
 | `agent-notes-log.el`    | The per-review log and its buffer                                                                                |
 | `agent-notes-agent.el`  | Prompts, each agent's arguments, running the agent, applying its answers, detecting its edits, suggested changes |
+| `agent-notes-github.el` | Posting notes to a pull request with the GitHub CLI                                                              |
 | `agent-notes-magit.el`  | `@` in Magit and `magit-dispatch`, and the status section; loaded once Magit is loaded                           |
 | `agent-notes.el`        | The mode, keymap, commands, menus and entry points                                                               |
 
