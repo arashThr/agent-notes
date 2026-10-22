@@ -1015,6 +1015,35 @@ It runs SHELL, prints ANSWER and ignores its arguments."
                   '(:prompt "p" :session "s1" :resume t :output-file "/tmp/o"))))
       (should (equal (cadr (member "--sandbox" args)) "workspace-write"))
       (should (equal (last args 3) '("resume" "s1" "p"))))
+    ;; Grok: rules in the Claude Code syntax, --add-dir only for a new session.
+    (cl-letf (((symbol-function 'agent-notes--grok-session-p) #'ignore))
+      (let* ((agent-notes-allow-edits nil)
+             (agent-notes-allowed-tools '("shell(git diff)"))
+             (agent-notes-denied-tools nil)
+             (args (agent-notes--grok-args '(:prompt "p" :session "s1"))))
+        (should (equal (cadr (member "--session-id" args)) "s1"))
+        (should (member "--add-dir" args))
+        (should-not (member "--resume" args))
+        (should (equal (cadr (member "--allow" args)) "Bash(git diff:*)"))
+        (should (member "Edit" args))
+        (should (equal (cadr (member "--permission-mode" args)) "default"))
+        (should (equal (last args 2) '("-p" "p"))))
+      (let* ((agent-notes-allow-edits t)
+             (args (agent-notes--grok-args '(:prompt "p" :session "s1" :resume t))))
+        (should (equal (cadr (member "--resume" args)) "s1"))
+        (should-not (member "--session-id" args))
+        (should-not (member "--add-dir" args))
+        (should-not (member "--deny" args))
+        (should (equal (cadr (member "--permission-mode" args)) "acceptEdits"))))
+    (let* ((home (make-temp-file "agent-notes-grok" t))
+           (process-environment (cons (concat "GROK_HOME=" home) process-environment)))
+      (unwind-protect
+          (progn
+            (should-not (agent-notes--grok-session-p "s2"))
+            (make-directory (expand-file-name "sessions/%2Ftmp%2Frepo/s2" home) t)
+            (should (agent-notes--grok-session-p "s2"))
+            (should (member "--resume" (agent-notes--grok-args '(:prompt "p" :session "s2")))))
+        (delete-directory home t)))
     (let ((agent-notes-agent 'claude))
       (should (equal (agent-notes--agent-name) "Claude Code"))
       (should (string-search "Claude Code" (agent-notes--choose-agent-description)))
@@ -1094,6 +1123,32 @@ It runs SHELL, prints ANSWER and ignores its arguments."
                                (agent-notes--read-file (concat tmp "codex-args"))))
         ;; The session survives reopening the review.
         (should (string-search "\"agent\": \"codex\"" (agent-notes--read-file agent-notes--file)))))))
+
+(ert-deftest agent-notes-test-grok-run ()
+  (agent-notes-tests--with-repo
+    (cl-letf (((symbol-function 'agent-notes--grok-session-p) #'ignore))
+      (let ((agent-notes-agent 'grok)
+            (agent-notes-grok-program
+             (agent-notes-tests--script
+              tmp "fake-grok"
+              (concat "echo \"$@\" >> " tmp "grok-args\n"
+                      "cat <<'EOF'\n```json\n{\"summary\": \"From Grok.\", \"notes\": []}\n```\nEOF\n"))))
+        (agent-notes--start-task '("Mine" . "Explain the tests."))
+        (agent-notes-tests--wait)
+        (let ((session (plist-get agent-notes--review :session)))
+          (should (equal (plist-get agent-notes--review :agent) "grok"))
+          (should (plist-get agent-notes--review :session_used))
+          (should (string-search (concat "--session-id " session)
+                                 (agent-notes--read-file (concat tmp "grok-args"))))
+          (should (string-search "Explain the tests."
+                                 (agent-notes--read-file (concat tmp "grok-args"))))
+          (should (equal (plist-get (car (last (plist-get agent-notes--review :summaries))) :text)
+                         "From Grok."))
+          (should (string-search "Grok: idle" (agent-notes--header-line)))
+          (agent-notes--start-task '("Mine" . "Again."))
+          (agent-notes-tests--wait)
+          (should (string-search (concat "--resume " session)
+                                 (agent-notes--read-file (concat tmp "grok-args")))))))))
 
 ;;;; Posting to GitHub
 

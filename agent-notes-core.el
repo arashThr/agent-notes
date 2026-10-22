@@ -35,6 +35,7 @@ includes its whole thread and the code around it."
   :type '(choice (const :tag "GitHub Copilot CLI" copilot)
                  (const :tag "Claude Code" claude)
                  (const :tag "OpenAI Codex CLI" codex)
+                 (const :tag "xAI Grok CLI" grok)
                  (symbol :tag "Other agent in `agent-notes-agents'")))
 
 (defcustom agent-notes-copilot-program "copilot"
@@ -53,6 +54,15 @@ For example \\='(\"--model\" \"gpt-5\")."
 (defcustom agent-notes-claude-extra-args nil
   "Extra arguments passed to every Claude Code invocation.
 For example \\='(\"--model\" \"opus\")."
+  :type '(repeat string))
+
+(defcustom agent-notes-grok-program "grok"
+  "Name or path of the xAI Grok CLI executable."
+  :type 'string)
+
+(defcustom agent-notes-grok-extra-args nil
+  "Extra arguments passed to every Grok invocation.
+For example \\='(\"--model\" \"grok-4.6\")."
   :type '(repeat string))
 
 (defcustom agent-notes-codex-program "codex"
@@ -503,6 +513,8 @@ Only set a background here, so the colors of the code stay visible.")
              :args agent-notes--copilot-args)
     (claude :name "Claude Code" :program agent-notes-claude-program
             :args agent-notes--claude-args :stdin t)
+    (grok :name "Grok" :program agent-notes-grok-program
+          :args agent-notes--grok-args)
     (codex :name "Codex" :program agent-notes-codex-program
            :args agent-notes--codex-args :output-file t
            :session-regexp "^session id: \\([-0-9a-zA-Z]+\\)"))

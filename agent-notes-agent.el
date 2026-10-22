@@ -567,6 +567,34 @@ session with --session-id; later ones continue it with --resume."
             (and denied (cons "--disallowedTools" denied))
             agent-notes-claude-extra-args)))
 
+(defun agent-notes--grok-session-p (session)
+  "Return non-nil if Grok has stored the conversation SESSION."
+  (let ((dir (expand-file-name "sessions" (or (getenv "GROK_HOME") "~/.grok"))))
+    (and (stringp session) (file-directory-p dir)
+         (file-expand-wildcards (expand-file-name (concat "*/" session) dir)))))
+
+(defun agent-notes--grok-args (request)
+  "Return the Grok arguments for REQUEST; see `agent-notes-agents'.
+The first request creates the session with --session-id; later ones
+continue it with --resume.  Grok reads permission rules in the
+Claude Code syntax, and refuses --add-dir together with --resume, so
+the review's folder is added only when the session is created."
+  (let* ((session (plist-get request :session))
+         (resume (or (plist-get request :resume) (agent-notes--grok-session-p session)))
+         (allowed (delq nil (mapcar #'agent-notes--claude-tool agent-notes-allowed-tools)))
+         (denied (append (delq nil (mapcar #'agent-notes--claude-tool agent-notes-denied-tools))
+                         (unless agent-notes-allow-edits agent-notes--claude-edit-tools))))
+    (append (list "--output-format" "plain")
+            (if resume
+                (list "--resume" session)
+              (list "--session-id" session
+                    "--add-dir" (file-name-directory agent-notes--file)))
+            (list "--permission-mode" (if agent-notes-allow-edits "acceptEdits" "default"))
+            (apply #'append (mapcar (lambda (rule) (list "--allow" rule)) allowed))
+            (apply #'append (mapcar (lambda (rule) (list "--deny" rule)) denied))
+            agent-notes-grok-extra-args
+            (list "-p" (plist-get request :prompt)))))
+
 (defun agent-notes--codex-args (request)
   "Return the Codex arguments for REQUEST; see `agent-notes-agents'.
 Codex runs in its sandbox, read-only unless `agent-notes-allow-edits'.

@@ -5,7 +5,7 @@ Guidance for AI agents working on this repository.
 ## What this is
 
 `agent-notes` is an Emacs package for reviewing git changes together with an
-AI agent CLI (GitHub Copilot, Claude Code or Codex), integrated with Magit.
+AI agent CLI (GitHub Copilot, Claude Code, Codex or Grok), integrated with Magit.
 The agent leaves notes on diff lines; the user navigates them, replies,
 creates notes, edits or deletes unsent comments, resolves threads, and sends
 queued comments in one batch. The agent can edit the working tree when asked,
@@ -98,6 +98,9 @@ least one review, e.g. `/tmp/an-demo4/`):
   options for the program and extra args, and tests with a fake script.
 - Codex support is untested against the real CLI; Claude Code was checked
   against `claude --help` (2.1.117) but only exercised with a fake script.
+  Grok was checked against `grok --help` and its headless docs (1.0.67), also
+  only with a fake script. It takes `--add-dir` only with `--session-id`, not
+  with `--resume`.
 - Posting to GitHub is user-initiated (`G`); the agent only drafts text in a
   reply's `github` field (`:github_draft`) and never runs `gh`. It goes through `agent-notes--gh`,
   which takes a list of argv strings (no shell). Tests stub that function; never

@@ -1,6 +1,6 @@
 # agent-notes
 
-Go through the changes in a git repository with an AI agent (GitHub Copilot CLI, Claude Code or the Codex CLI), inside Emacs.
+Go through the changes in a git repository with an AI agent (GitHub Copilot CLI, Claude Code, the Codex CLI or the Grok CLI), inside Emacs.
 
 The diff is shown in a Magit-style buffer, unified or side by side, with the syntax highlighting of each file's major mode. You give the agent a task, such as a bug review, an overview of the important changes, a diagram, or your own instructions. Its notes appear under the lines they refer to. You can reply, add your own notes, and resolve threads. Your comments are queued, and nothing goes to the agent until you send them all with `s`. If you ask for a change, the agent edits the code; when it suggests a change in a note, `a` applies it. You can also edit files yourself. Either way, the diff refreshes and the notes move with the code.
 
@@ -26,7 +26,8 @@ stats.py
 - One agent CLI, installed and signed in:
   - the [GitHub Copilot CLI](https://github.com/github/copilot-cli) (`copilot`), the default;
   - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`);
-  - or the [OpenAI Codex CLI](https://github.com/openai/codex) (`codex`).
+  - or the [OpenAI Codex CLI](https://github.com/openai/codex) (`codex`);
+  - or the xAI Grok CLI (`grok`, Grok Build).
 - Optional, to post notes to GitHub: the [GitHub CLI](https://cli.github.com) (`gh`, `brew install gh`), signed in with `gh auth login`. See [Posting to GitHub](#posting-to-github).
 
 ## Setup
@@ -76,7 +77,7 @@ You can also pick "Custom instructions…" or type your own text, for example "e
 
 ### Choosing the agent
 
-Set `agent-notes-agent` to `copilot` (the default), `claude` or `codex`. You can also switch for the current Emacs session with `@` in a review, or `a` in `agent-notes-menu`. The header line shows the agent that will run the next request ("Claude Code: idle"). It also shows the file the cursor is in, in bold, so you always know which file you are looking at. Hunk headings show only the surrounding function or class, without line numbers or counts.
+Set `agent-notes-agent` to `copilot` (the default), `claude`, `codex` or `grok`. You can also switch for the current Emacs session with `@` in a review, or `a` in `agent-notes-menu`. The header line shows the agent that will run the next request ("Claude Code: idle"). It also shows the file the cursor is in, in bold, so you always know which file you are looking at. Hunk headings show only the surrounding function or class, without line numbers or counts.
 
 Each review remembers its session with an agent. If you switch agents in the middle of a review, the next request starts a new session with the new agent, and the log says so. The new agent doesn't remember earlier requests. Replies still work well, because each one includes its whole thread and the code around it.
 
@@ -85,8 +86,9 @@ Each review remembers its session with an agent. If you switch agents in the mid
 | Copilot     | argument | `--session-id <uuid>`                                                 | `--allow-tool` for each of `agent-notes-allowed-tools`, plus `write` when edits are allowed                                                                       |
 | Claude Code | stdin    | `--session-id <uuid>` the first time, then `--resume <uuid>`          | `--allowedTools`, where `shell(git diff)` becomes `Bash(git diff:*)`; `--permission-mode acceptEdits` when edits are allowed, otherwise the edit tools are denied |
 | Codex       | argument | `codex exec`, then `codex exec resume <id>`, with the id Codex prints | `--sandbox workspace-write` when edits are allowed, otherwise `read-only`; the answer is read from `--output-last-message`                                        |
+| Grok        | argument | `--session-id <uuid>` the first time, then `--resume <uuid>`          | `--allow` and `--deny` rules, written like Claude Code's; `--permission-mode acceptEdits` when edits are allowed, otherwise the edit tools are denied             |
 
-The programs are `agent-notes-copilot-program`, `agent-notes-claude-program` and `agent-notes-codex-program`. Extra arguments, such as the model, go in `agent-notes-copilot-extra-args`, `agent-notes-claude-extra-args` and `agent-notes-codex-extra-args`. To add another CLI, add an entry to `agent-notes-agents` with a function that builds its arguments; its docstring describes the format. Every prompt is the same whichever agent runs it.
+The programs are `agent-notes-copilot-program`, `agent-notes-claude-program`, `agent-notes-codex-program` and `agent-notes-grok-program`. Extra arguments, such as the model, go in `agent-notes-copilot-extra-args`, `agent-notes-claude-extra-args`, `agent-notes-codex-extra-args` and `agent-notes-grok-extra-args`. To add another CLI, add an entry to `agent-notes-agents` with a function that builds its arguments; its docstring describes the format. Every prompt is the same whichever agent runs it.
 
 ### Keys in the review buffer
 
@@ -111,7 +113,7 @@ Press `?` (or `h`) for a menu with all of these.
 | `G`             | Post the note's comment (or the agent's GitHub draft) to the pull request; `C-u` chooses the pull request           |
 | `s`             | Send all unsent comments to the agent                                                                               |
 | `A`             | Give the agent a task                                                                                               |
-| `@`             | Choose the agent (Copilot, Claude Code, Codex)                                                                      |
+| `@`             | Choose the agent (Copilot, Claude Code, Codex, Grok)                                                                |
 | `g`             | Refresh the diff (same scope and base) and move notes with their code                                               |
 | `RET` / `o`     | Open the file at that line, to read or edit it (on a diagram: open its Graphviz source)                             |
 | `$`             | Show the log: what was sent, how long it took, what came back and what changed                                      |
@@ -220,8 +222,8 @@ The text is passed to `gh` as separate arguments, with no shell, so quotes and `
 - `agent-notes-gh-program`: the GitHub CLI used by `G`
 - `agent-notes-syntax-highlighting`: highlight code with the file's major mode (mode hooks are not run, so no language server starts). The faces `agent-notes-added-bg` and `agent-notes-removed-bg` set the backgrounds.
 - `agent-notes-refresh-on-save`: refresh reviews when you save a file of the repository
-- `agent-notes-agent`: `copilot`, `claude` or `codex`
-- `agent-notes-copilot-extra-args`, `agent-notes-claude-extra-args`, `agent-notes-codex-extra-args`: for example `'("--model" "gpt-5")` or `'("--model" "opus")`
+- `agent-notes-agent`: `copilot`, `claude`, `codex` or `grok`
+- `agent-notes-copilot-extra-args`, `agent-notes-claude-extra-args`, `agent-notes-codex-extra-args`, `agent-notes-grok-extra-args`: for example `'("--model" "gpt-5")` or `'("--model" "opus")`
 - `agent-notes-base-branch`: the default base branch for branch reviews
 - `agent-notes-diagram-format`: `auto` (Graphviz if `dot` is installed), `graphviz` or `text`; `agent-notes-dot-program` is the Graphviz program
 
@@ -250,7 +252,7 @@ emacs -Q --batch \
 
 Set `package-user-dir` to where your Magit and transient are installed, and use the same Emacs that compiled them.
 
-- `test/agent-notes-tests.el` also runs the whole request cycle against fake `copilot`, `claude` and `codex` scripts, in a scratch git repository, and checks every diff source. It needs no real agent requests.
+- `test/agent-notes-tests.el` also runs the whole request cycle against fake `copilot`, `claude`, `codex` and `grok` scripts, in a scratch git repository, and checks every diff source. It needs no real agent requests.
 - `test/integ.el` checks the Magit integration and simulated agent edits, without any Copilot requests.
 - `test/e2e.el` runs a real Overview task and a code-change request against Copilot. It uses 2 requests.
 

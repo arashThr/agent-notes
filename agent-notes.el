@@ -10,8 +10,8 @@
 ;;; Commentary:
 
 ;; Agent Notes lets you go through the changes in a git repository
-;; together with an AI agent (GitHub Copilot CLI, Claude Code or the
-;; Codex CLI; see `agent-notes-agent'), using notes attached to lines
+;; together with an AI agent (GitHub Copilot CLI, Claude Code, the
+;; Codex CLI or the Grok CLI; see `agent-notes-agent'), using notes attached to lines
 ;; of a read-only diff.
 ;;
 ;; - M-x agent-notes-review   Snapshot the changes (the working tree,
