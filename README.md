@@ -261,3 +261,5 @@ See the comments at the top of each file.
 ## License
 
 GPL-3.0-or-later. See [`LICENSE`](LICENSE).
+
+By [ArashThr](https://arashtaher.com). Large parts of this package were written with AI assistance (Claude Opus 5.5 and Sonnet 5.5).

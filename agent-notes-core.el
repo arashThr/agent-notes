@@ -2,6 +2,21 @@
 
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
+;; Copyright (C) 2026 ArashThr
+
+;; This program is free software; you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+
+;; You should have received a copy of the GNU General Public License
+;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 ;; This file is not part of GNU Emacs.
 
 ;;; Commentary:
@@ -169,9 +184,6 @@ receives the context of the review (repository, scope, diff) and
 the format for notes; INSTRUCTIONS say what to do with them."
   :type '(alist :key-type (string :tag "Name")
                 :value-type (string :tag "Instructions")))
-
-(define-obsolete-variable-alias 'agent-notes-review-instructions
-  'agent-notes-extra-instructions "0.2.0")
 
 (defcustom agent-notes-inline-diff-limit 40000
   "Largest diff, in characters, that is put in the prompt of a task.
