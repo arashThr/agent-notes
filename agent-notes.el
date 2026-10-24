@@ -2,10 +2,10 @@
 
 ;; Author: ArashThr <arash.thr@live.com>
 ;; Maintainer: ArashThr <arash.thr@live.com>
-;; Assisted-by: Claude:opus-5.5
-;; Assisted-by: Claude:sonnet-5.5
-;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (magit-section "4.0") (transient "0.7"))
+;; Assisted-by: Claude:claude-opus-5-5
+;; Assisted-by: Claude:claude-sonnet-5-5
+;; Version: 0.0.1
+;; Package-Requires: ((emacs "29.1") (magit "4.0") (magit-section "4.0") (transient "0.7"))
 ;; URL: https://github.com/arashThr/agent-notes
 ;; Keywords: tools, vc, convenience
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -31,8 +31,8 @@
 
 ;; Agent Notes lets you go through the changes in a git repository
 ;; together with an AI agent (GitHub Copilot CLI, Claude Code, the
-;; Codex CLI or the Grok CLI; see `agent-notes-agent'), using notes attached to lines
-;; of a read-only diff.
+;; Codex CLI or the Grok CLI; see `agent-notes-agent'), using notes
+;; attached to lines of a read-only diff.
 ;;
 ;; - M-x agent-notes-review   Snapshot the changes (the working tree,
 ;;                            the staged changes, the current branch vs.
@@ -42,8 +42,9 @@
 ;;                            diagram, or your own instructions.  Its
 ;;                            notes appear inline.
 ;; - M-x agent-notes-open     Reopen a previous review.
-;; - M-x agent-notes-menu     All of the above in a menu.  In Magit it is
-;;                            on `@', and in `magit-dispatch'.
+;; - M-x agent-notes-menu     All of the above in a menu.  With
+;;                            `agent-notes-magit-mode' it is on `@' in
+;;                            Magit buffers and in `magit-dispatch'.
 ;;
 ;; The review buffer is built on `magit-section': files, hunks and
 ;; notes fold with TAB, and the diff can be shown unified or side by
@@ -67,7 +68,7 @@
 ;; - agent-notes-log.el     the log of a review
 ;; - agent-notes-agent.el   prompts, running the agent, applying answers
 ;; - agent-notes-github.el  posting notes to a pull request with `gh'
-;; - agent-notes-magit.el   Magit integration, loaded with Magit
+;; - agent-notes-magit.el   `agent-notes-magit-mode', the Magit integration
 ;; - agent-notes.el         the mode, commands, menus and entry points
 
 ;;; Code:
@@ -75,6 +76,7 @@
 (require 'cl-lib)
 (require 'eieio)
 (require 'subr-x)
+(require 'magit)
 (require 'magit-section)
 (require 'transient)
 (require 'agent-notes-core)
@@ -83,6 +85,7 @@
 (require 'agent-notes-log)
 (require 'agent-notes-agent)
 (require 'agent-notes-github)
+(require 'agent-notes-magit)
 
 ;; Introduced in magit-section 4.3.6.
 (defvar magit-section-highlight-current)
@@ -250,8 +253,11 @@ When done, call CALLBACK with the text in the review buffer."
   "Move point to SECTION, unfolding the sections that contain it.
 Point goes to the start of the text, which for a note in the right
 column of the side-by-side view is not the start of the line."
+  ;; Like `magit-section-reveal', which needs magit-section 4.4.
   (let ((parent (oref section parent)))
-    (when parent (magit-section-reveal parent)))
+    (while parent
+      (when (oref parent hidden) (magit-section-show parent))
+      (setq parent (oref parent parent))))
   (goto-char (oref section start))
   (goto-char (agent-notes--pane-start))
   (let ((win (get-buffer-window (current-buffer))))
@@ -356,17 +362,18 @@ added to the error when there are none."
       (message "Note #%d (%d of %d %s)" (oref target value)
                (1+ (cl-position target targets)) (length targets) what))))
 
-(defun agent-notes--note-filter (all agent-only)
+(defun agent-notes--note-filter (include-resolved agent-only)
   "Return a predicate on note sections.
-Unless ALL, it rejects resolved notes; with AGENT-ONLY, notes you wrote."
+Unless INCLUDE-RESOLVED, it rejects resolved notes; with AGENT-ONLY,
+notes you wrote."
   (lambda (section)
     (let ((note (agent-notes--note (oref section value))))
-      (and (or all (not (agent-notes--resolved-p note)))
+      (and (or include-resolved (not (agent-notes--resolved-p note)))
            (or (not agent-only) (equal (plist-get note :author) "agent"))))))
 
 (defun agent-notes--jump-note (forward all agent-only)
   "Move to the next note, or the previous one unless FORWARD.
-See `agent-notes--note-filter' for ALL and AGENT-ONLY."
+ALL includes resolved notes; AGENT-ONLY skips the notes you wrote."
   (agent-notes--jump 'agent-notes-note forward
                      (concat (if all "" "open ") (if agent-only "agent notes" "notes"))
                      (agent-notes--note-filter all agent-only)
@@ -726,6 +733,7 @@ own instructions."
       (kill-process agent-notes--process)
     (user-error "The agent is not running")))
 
+;;;###autoload
 (defun agent-notes-choose-agent (agent)
   "Use AGENT, a key of `agent-notes-agents', for the next requests.
 This sets `agent-notes-agent' for this Emacs session; customize it
@@ -874,8 +882,6 @@ all with \\[agent-notes-send].  Press \\[agent-notes-dispatch] for a menu of all
     (completing-read (format-prompt "Base branch" default)
                      (agent-notes--branches) nil nil nil nil default)))
 
-(declare-function magit-commit-at-point "magit-git" ())
-
 (defvar agent-notes--rev-history nil
   "History of commits and ranges given to `agent-notes-review-commit'.")
 
@@ -888,8 +894,7 @@ This works in Magit buffers such as the log; elsewhere return nil."
            ;; Magit lists the newest first; include the oldest commit too.
            (format "%s^..%s" (car (last revs)) (car revs)))
           (revs (car revs))
-          ((fboundp 'magit-commit-at-point)
-           (ignore-errors (magit-commit-at-point))))))
+          (t (ignore-errors (magit-commit-at-point))))))
 
 (defun agent-notes--read-commit-or-range ()
   "Read a commit, or a range A..B or A...B."
@@ -1033,8 +1038,5 @@ The agent edits the working tree, which may differ from REV."
     (pop-to-buffer-same-window (agent-notes--get-buffer file))))
 
 (provide 'agent-notes)
-
-(with-eval-after-load 'magit
-  (require 'agent-notes-magit))
 
 ;;; agent-notes.el ends here

@@ -28,6 +28,7 @@
 
 ;;; Code:
 
+(require 'magit)
 (require 'agent-notes-core)
 
 ;;;; Git
@@ -76,12 +77,10 @@
     (unless top (user-error "Not inside a git repository"))
     (file-name-as-directory top)))
 
-(declare-function magit-gitdir "magit-git" (&optional directory common))
-
 (defun agent-notes--directory ()
   "Return the directory that stores reviews for the current repository."
   (expand-file-name agent-notes-directory-name
-                    (or (and (fboundp 'magit-gitdir) (ignore-errors (magit-gitdir)))
+                    (or (ignore-errors (magit-gitdir))
                         (agent-notes--git-try "rev-parse" "--absolute-git-dir")
                         (user-error "Not inside a git repository"))))
 

@@ -79,7 +79,7 @@ or set `agent-notes-gh-program'"))
   "Run the GitHub CLI with ARGS and return its output, or signal a `user-error'."
   (let ((result (agent-notes--gh args)))
     (unless (eql (plist-get result :code) 0)
-      (user-error "gh %s failed: %s" (string-join (seq-take args 2) " ")
+      (user-error "`gh %s' failed: %s" (string-join (seq-take args 2) " ")
                   (agent-notes--gh-error result)))
     (plist-get result :out)))
 
@@ -94,7 +94,7 @@ branch.  The plist has :number, :url, :title and :headRefOid."
     (cond ((eql (plist-get result :code) 0)
            (json-parse-string (plist-get result :out) :object-type 'plist))
           ((agent-notes--gh-auth-problem-p result)
-           (user-error "gh pr view failed: %s" (agent-notes--gh-error result))))))
+           (user-error "`gh pr view' failed: %s" (agent-notes--gh-error result))))))
 
 (defun agent-notes--gh-read-ref (stored prompt)
   "Read the number or URL of a pull request, starting from STORED.

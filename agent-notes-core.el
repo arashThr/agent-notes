@@ -255,19 +255,19 @@ characters; `auto': `graphviz' if `dot' is installed, else `text'."
 (defface agent-notes-note
   '((((class color) (background dark)) :background "#252a36" :extend t)
     (((class color) (background light)) :background "#f5f1e6" :extend t)
-    (t :inherit highlight :extend t))
+    (t :inverse-video t :extend t))
   "Background of note blocks.")
 
 (defface agent-notes-border '((t :inherit shadow))
   "Face for the frame drawn around notes and between diff columns.")
 
-(defface agent-notes-agent '((t :inherit font-lock-keyword-face :weight bold))
+(defface agent-notes-agent '((t :inherit (bold font-lock-keyword-face)))
   "Face for the agent's name.")
 
-(defface agent-notes-you '((t :inherit font-lock-string-face :weight bold))
+(defface agent-notes-you '((t :inherit (bold font-lock-string-face)))
   "Face for your name.")
 
-(defface agent-notes-pending '((t :inherit warning :slant italic :weight normal))
+(defface agent-notes-pending '((t :inherit (italic warning)))
   "Face for unsent comments and work in progress.")
 
 (defface agent-notes-resolved '((t :inherit shadow))
@@ -282,13 +282,13 @@ characters; `auto': `graphviz' if `dot' is installed, else `text'."
 (defface agent-notes-code-block '((t :inherit font-lock-constant-face))
   "Face for fenced code blocks and diagrams in notes and summaries.")
 
-(defface agent-notes-title '((t :inherit bold :height 1.2))
+(defface agent-notes-title '((t :inherit bold))
   "Face for the review title.")
 
-(defface agent-notes-file-header '((t :inherit diff-file-header :extend t))
+(defface agent-notes-file-header '((t :inherit diff-file-header))
   "Face for file headers.")
 
-(defface agent-notes-hunk-header '((t :inherit diff-hunk-header :extend t))
+(defface agent-notes-hunk-header '((t :inherit diff-hunk-header))
   "Face for hunk headers.")
 
 (defface agent-notes-line-number '((t :inherit line-number))

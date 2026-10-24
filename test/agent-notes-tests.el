@@ -729,19 +729,20 @@ It runs SHELL, prints ANSWER and ignores its arguments."
       (goto-char (point-min))
       (search-forward "digraph")
       (should (equal (get-text-property (point) 'agent-notes-diagram) "digraph { a -> b }")))
-    ;; With images, the diagram is an image.
-    (with-temp-buffer
-      (cl-letf (((symbol-function 'agent-notes--diagram-images-p) (lambda () t))
-                ((symbol-function 'agent-notes--render-dot)
-                 (lambda (_source) "<svg xmlns=\"http://www.w3.org/2000/svg\"/>")))
-        (agent-notes--insert-markdown text 'default "  " t))
-      (should-not (string-search "digraph" (buffer-string)))
-      (goto-char (point-min))
-      (let ((match (text-property-search-forward 'display nil (lambda (_ v) v))))
-        (should match)
-        (should (eq (car-safe (prop-match-value match)) 'image))
-        (should (equal (get-text-property (prop-match-beginning match) 'agent-notes-diagram)
-                       "digraph { a -> b }")))))
+    ;; With images, the diagram is an image (needs an Emacs built with SVG).
+    (when (image-type-available-p 'svg)
+      (with-temp-buffer
+        (cl-letf (((symbol-function 'agent-notes--diagram-images-p) (lambda () t))
+                  ((symbol-function 'agent-notes--render-dot)
+                   (lambda (_source) "<svg xmlns=\"http://www.w3.org/2000/svg\"/>")))
+          (agent-notes--insert-markdown text 'default "  " t))
+        (should-not (string-search "digraph" (buffer-string)))
+        (goto-char (point-min))
+        (let ((match (text-property-search-forward 'display nil (lambda (_ v) v))))
+          (should match)
+          (should (eq (car-safe (prop-match-value match)) 'image))
+          (should (equal (get-text-property (prop-match-beginning match) 'agent-notes-diagram)
+                         "digraph { a -> b }"))))))
   (when (executable-find agent-notes-dot-program)
     (should (string-search "<svg" (agent-notes--render-dot "digraph { a -> b }")))
     (should-not (agent-notes--render-dot "this is not dot"))))
@@ -1393,6 +1394,48 @@ on an added line, #3 on a removed line and #4 a general note."
     (let ((prompt (agent-notes--reply-prompt (list (agent-notes--note 1)) '(1))))
       (should (string-search "\"github\"" prompt))
       (should (string-search "do NOT run gh" prompt)))))
+
+;;;; Magit
+
+(ert-deftest agent-notes-test-magit-status-section-keymap ()
+  (with-temp-buffer
+    (magit-section-mode)
+    (let ((inhibit-read-only t))
+      ;; In the status buffer it is a child; the root gets no keymap.
+      (magit-insert-section (agent-notes-root)
+        (magit-insert-section (agent-notes-status-section "review.json")
+          (insert "Agent review\n"))))
+    (goto-char (point-min))
+    (should (eq (oref (magit-current-section) type) 'agent-notes-status-section))
+    (should (eq (oref (magit-current-section) keymap) 'agent-notes-status-section-map))
+    (should (eq (key-binding (kbd "RET")) #'agent-notes-open-at-point))))
+
+(ert-deftest agent-notes-test-magit-mode ()
+  (let ((was agent-notes-magit-mode)
+        (has-hook (lambda ()
+                    (memq #'agent-notes-insert-status-section
+                          (default-value 'magit-status-sections-hook))))
+        (in-dispatch (lambda ()
+                       (ignore-errors (transient-get-suffix 'magit-dispatch "@")))))
+    (unwind-protect
+        (progn
+          (agent-notes-magit-mode -1)
+          (should-not (keymap-lookup magit-mode-map "@"))
+          (should-not (funcall in-dispatch))
+          (should-not (funcall has-hook))
+          (agent-notes-magit-mode 1)
+          (should (eq (keymap-lookup magit-mode-map "@") #'agent-notes-menu))
+          (should (funcall in-dispatch))
+          (should (funcall has-hook))
+          ;; Enabling twice adds nothing twice.
+          (agent-notes-magit-mode 1)
+          (should (= 1 (cl-count #'agent-notes-insert-status-section
+                                 (default-value 'magit-status-sections-hook))))
+          (agent-notes-magit-mode -1)
+          (should-not (keymap-lookup magit-mode-map "@"))
+          (should-not (funcall in-dispatch))
+          (should-not (funcall has-hook)))
+      (agent-notes-magit-mode (if was 1 -1)))))
 
 (provide 'agent-notes-tests)
 ;;; agent-notes-tests.el ends here

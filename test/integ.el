@@ -6,6 +6,7 @@
 
 (require 'magit)
 (require 'agent-notes)
+(agent-notes-magit-mode 1)
 
 (princ (format "agent-notes-magit loaded: %S\n" (featurep 'agent-notes-magit)))
 (princ (format "@ in magit-mode-map: %S\n" (keymap-lookup magit-mode-map "@")))

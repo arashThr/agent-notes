@@ -24,7 +24,7 @@ Load order follows the dependencies (each file requires the ones above it):
 | `agent-notes-log.el`        | The human-readable activity log buffer                                                                                                      |
 | `agent-notes-agent.el`      | Prompts, building CLI arguments per agent, running the process, parsing answers, applying suggestions, detecting agent edits                |
 | `agent-notes-github.el`     | Posting a note to a pull request with the `gh` CLI (user-initiated only; the command itself is in `agent-notes.el`)                         |
-| `agent-notes-magit.el`      | Magit integration (optional; loaded from Magit buffers)                                                                                     |
+| `agent-notes-magit.el`      | Magit integration: the opt-in global minor mode `agent-notes-magit-mode` (`@`, `magit-dispatch`, status section)                            |
 | `agent-notes.el`            | Entry point: major mode, commands, key maps, transient menus                                                                                |
 | `test/agent-notes-tests.el` | ERT tests                                                                                                                                   |
 | `test/integ.el`             | Batch integration check with Magit against a scratch repo (no agent requests)                                                               |
@@ -78,8 +78,13 @@ least one review, e.g. `/tmp/an-demo4/`):
 
 - Every file uses `lexical-binding: t`. Private names use `agent-notes--`.
 - Docstring lines must be at most 80 columns (the compiler warns).
-- Use `declare-function` for optional libraries (Magit in non-Magit files,
-  graphviz, etc.) so the strict compile stays clean.
+- Use `declare-function` for optional libraries (graphviz, etc.) so the
+  strict compile stays clean. Magit is a required dependency.
+- `agent-notes-magit.el` must not require `agent-notes`: users enable
+  `agent-notes-magit-mode` from `with-eval-after-load 'magit`, which can run
+  while `agent-notes.el` is loading Magit. Load it lazily instead.
+- Faces must not combine `:inherit` with attributes that override it (MELPA
+  review); inherit a list of faces instead.
 - Never put `default` in a face list: it resets the note background. Build
   face lists with `agent-notes--faces`.
 - `magit-insert-heading` must produce a single line.

@@ -22,7 +22,7 @@ stats.py
 ## Requirements
 
 - Emacs 29.1 or newer
-- `magit-section` and `transient`, which come with Magit. Magit itself is optional; it adds the integration described below.
+- Magit 4.0 or newer (with `magit-section` and `transient`)
 - One agent CLI, installed and signed in:
   - the [GitHub Copilot CLI](https://github.com/github/copilot-cli) (`copilot`), the default;
   - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`);
@@ -32,21 +32,36 @@ stats.py
 
 ## Setup
 
+From MELPA:
+
+```elisp
+(use-package agent-notes
+  :ensure t
+  :bind (("C-c g a" . agent-notes-menu)
+         ("C-c g r" . agent-notes-review)
+         ("C-c g o" . agent-notes-open))
+  :init (with-eval-after-load 'magit (agent-notes-magit-mode 1)))
+```
+
+From a clone:
+
 ```elisp
 (use-package agent-notes
   :ensure nil
   :load-path "/path/to/agent-notes"
-  :init (with-eval-after-load 'magit (require 'agent-notes))
   :bind (("C-c g a" . agent-notes-menu)
          ("C-c g r" . agent-notes-review)
-         ("C-c g o" . agent-notes-open)))
+         ("C-c g o" . agent-notes-open))
+  :init (with-eval-after-load 'magit
+          (require 'agent-notes-magit)
+          (agent-notes-magit-mode 1)))
 ```
 
-The `:init` line loads the package together with Magit, so `@` works in Magit right away.
+`agent-notes-magit-mode` adds the Magit integration: `@` in Magit buffers and in `magit-dispatch`, and the status line. It is off by default; the `:init` line turns it on as soon as Magit is loaded, without loading the rest of agent-notes. The commands are autoloaded, so the package itself loads on first use.
 
 ## Usage
 
-- `M-x agent-notes-menu` (or `@` in any Magit buffer, or `@` in `magit-dispatch`) offers these commands:
+- `M-x agent-notes-menu` (or, with `agent-notes-magit-mode`, `@` in any Magit buffer or in `magit-dispatch`) offers these commands:
   - `w` review the working tree
   - `s` review the staged changes
   - `b` review the branch
@@ -59,7 +74,7 @@ The `:init` line loads the package together with Magit, so `@` works in Magit ri
   - **Staged**: only what is staged, compared to `HEAD`. Useful just before committing.
   - **Branch**: everything since the current branch forked from a base branch (default `origin/HEAD`, then `main`/`master`). Uncommitted work is included unless `agent-notes-branch-include-uncommitted` is nil.
   - **Commit or range**: a commit compared to its (first) parent, such as `HEAD` or `a1b2c3d`; or a range, `A..B` (from `A` to `B`) or `A...B` (what `B` added since it forked from `A`). An empty side means `HEAD`, so `HEAD~3..` is the last three commits. In a Magit log, the default is the commit at point; with a region over several commits, it is the range covering all of them.
-- The Magit status buffer shows the latest review ("Agent review: … · 2 open, 1 unsent"). `RET` on that line opens it. Turn it off with `agent-notes-magit-status-section`.
+- With `agent-notes-magit-mode`, the Magit status buffer shows the latest review ("Agent review: … · 2 open, 1 unsent"). `RET` on that line opens it. Turn it off with `agent-notes-magit-status-section`.
 
 A review of a commit stays on that commit. `g` and saving files don't change it, because it is stored by the commit's id. A range is kept as you typed it, so `g` follows the branches it names, like a branch review does.
 
@@ -215,6 +230,7 @@ The text is passed to `gh` as separate arguments, with no shell, so quotes and `
 - `agent-notes-inline-diff-limit`: the largest diff (in characters) put in a task's prompt; `nil` never includes it
 - `agent-notes-thread-context-lines`: lines of code shown around each thread when replying
 - `agent-notes-allow-edits`: whether the agent may edit files
+- `agent-notes-allowed-tools`, `agent-notes-denied-tools`: what the agent may run, and what it must not (see the table in [Choosing the agent](#choosing-the-agent))
 - `agent-notes-default-view`: `unified` or `split`
 - `agent-notes-show-line-numbers`: whether new reviews show line numbers
 - `agent-notes-notify`: `always`, `unfocused` or `nil`, when to send a notification at the end of a request
@@ -225,6 +241,7 @@ The text is passed to `gh` as separate arguments, with no shell, so quotes and `
 - `agent-notes-agent`: `copilot`, `claude`, `codex` or `grok`
 - `agent-notes-copilot-extra-args`, `agent-notes-claude-extra-args`, `agent-notes-codex-extra-args`, `agent-notes-grok-extra-args`: for example `'("--model" "gpt-5")` or `'("--model" "opus")`
 - `agent-notes-base-branch`: the default base branch for branch reviews
+- `agent-notes-directory-name`: the directory under `.git/` where reviews are stored (`agent-notes`)
 - `agent-notes-diagram-format`: `auto` (Graphviz if `dot` is installed), `graphviz` or `text`; `agent-notes-dot-program` is the Graphviz program
 
 ## Development
@@ -239,7 +256,7 @@ The code is split by concern. Each file requires the ones above it:
 | `agent-notes-log.el`    | The per-review log and its buffer                                                                                |
 | `agent-notes-agent.el`  | Prompts, each agent's arguments, running the agent, applying its answers, detecting its edits, suggested changes |
 | `agent-notes-github.el` | Posting notes to a pull request with the GitHub CLI                                                              |
-| `agent-notes-magit.el`  | `@` in Magit and `magit-dispatch`, and the status section; loaded once Magit is loaded                           |
+| `agent-notes-magit.el`  | `agent-notes-magit-mode`: `@` in Magit and `magit-dispatch`, and the status section                              |
 | `agent-notes.el`        | The mode, keymap, commands, menus and entry points                                                               |
 
 The checks live in `test/`. Run the tests from the repository root:
@@ -262,4 +279,4 @@ See the comments at the top of each file.
 
 GPL-3.0-or-later. See [`LICENSE`](LICENSE).
 
-By [ArashThr](https://arashtaher.com). Large parts of this package were written with AI assistance (Claude Opus 5.5 and Sonnet 5.5).
+By [ArashThr](https://arashtaher.com). Large parts of this package were written with AI assistance (Claude Opus 5.5 and Sonnet 5.5); see the `Assisted-by` lines in `agent-notes.el`.
