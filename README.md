@@ -160,7 +160,7 @@ If [Graphviz](https://graphviz.org) is installed (`brew install graphviz`), the 
 
 ### When you are done
 
-When every note is resolved and nothing is unsent, the review says so, and the Magit status line shows "all resolved ✓". Commit as usual with Magit. The review stays in `.git/agent-notes/` as history and can be reopened with `o` in the menu. For the next round of changes, start a new review.
+When every note is resolved and nothing is unsent, the review says so, and the Magit status line shows "all resolved ✓". Commit as usual with Magit. The review stays in `.git/agent-notes/` as history and can be reopened with `o` in the menu. For your next round of changes, start a new review. For a pull request that gets new commits, keep the same review; see [Reviewing a pull request](#reviewing-a-pull-request).
 
 ### Notifications
 
@@ -184,6 +184,39 @@ What `G` does:
 4. The note shows "on GitHub", the comment's URL is kept in the review and shown in the echo area and the log, and posting the same note again asks first.
 
 The text is passed to `gh` as separate arguments, with no shell, so quotes and `$` in it are safe. Multi-line comments, and GitHub's "suggestion" blocks, are not special: write a block yourself in the compose buffer if you want one.
+
+### Reviewing a pull request
+
+A pull request is a branch review. Keep using the same review when the author pushes changes: your notes and the agent's session stay, and the notes follow the code.
+
+```mermaid
+sequenceDiagram
+    participant A as Author
+    participant PR as Pull request
+    participant Y as You in Emacs
+    participant AG as Agent
+    A->>PR: Open the pull request
+    PR-->>Y: Check out its branch (gh pr checkout)
+    Y->>AG: Branch review vs main, Overview task
+    AG-->>Y: Summary and notes
+    Y->>AG: Replies and new notes (R, c), sent with s
+    AG-->>Y: Answers
+    Y->>PR: Post findings (G)
+    A->>PR: Push changes
+    PR-->>Y: Pull the new commits
+    Y->>Y: Press g in the review
+    Note over Y: Notes move with their code, or are marked outdated
+    Y->>AG: Ask on each open note if it is fixed (R, then s)
+    AG-->>Y: Answers, resolves the fixed threads
+    Y->>AG: Optional, A then Review, for new problems
+    Y->>PR: Approve, or post what is left (G)
+```
+
+1. **Start.** Check out the pull request's branch, for example with `gh pr checkout 123`. Run `agent-notes-review`, choose **Branch** with the pull request's base (such as `main`), and a task such as **Overview** or **Review**.
+2. **Comment.** Go through the notes, reply with `R` or add your own with `c`, and send them with `s`. Notes stay on your machine; post what the author should see with `G`.
+3. **The author pushes.** Pull the branch (`F u` in Magit, or `gh pr checkout 123 --force` after a force push). Reopen the review (`l` or `o` in `agent-notes-menu`) and press `g`; pulling doesn't refresh it by itself. Be on the pull request's branch when you press `g`, because a branch review compares the current branch with its base.
+4. **Check the fixes.** The notes have moved with their code; a note whose code changed says "outdated: the code changed". Reply on each open note, such as "Is this fixed now?", and send all the replies with `s`. Each reply includes the current code around the note, and the agent resolves the threads that are settled. To look for new problems, press `A` and choose **Review**; the agent is told which notes already exist, so it doesn't repeat them. To review only the new commits, select them in the Magit log and press `@ c`; this starts a separate review of that range.
+5. **Finish.** When every note is resolved, approve the pull request on GitHub.
 
 ### The log
 
