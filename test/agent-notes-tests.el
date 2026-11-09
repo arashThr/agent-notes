@@ -1016,14 +1016,14 @@ It runs SHELL, prints ANSWER and ignores its arguments."
                   '(:prompt "p" :session "s1" :resume t :output-file "/tmp/o"))))
       (should (equal (cadr (member "--sandbox" args)) "workspace-write"))
       (should (equal (last args 3) '("resume" "s1" "p"))))
-    ;; Grok: rules in the Claude Code syntax, --add-dir only for a new session.
+    ;; Grok: rules in the Claude Code syntax, never --add-dir (1.0.77 refuses it).
     (cl-letf (((symbol-function 'agent-notes--grok-session-p) #'ignore))
       (let* ((agent-notes-allow-edits nil)
              (agent-notes-allowed-tools '("shell(git diff)"))
              (agent-notes-denied-tools nil)
              (args (agent-notes--grok-args '(:prompt "p" :session "s1"))))
         (should (equal (cadr (member "--session-id" args)) "s1"))
-        (should (member "--add-dir" args))
+        (should-not (member "--add-dir" args))
         (should-not (member "--resume" args))
         (should (equal (cadr (member "--allow" args)) "Bash(git diff:*)"))
         (should (member "Edit" args))

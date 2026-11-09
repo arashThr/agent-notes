@@ -592,8 +592,9 @@ session with --session-id; later ones continue it with --resume."
   "Return the Grok arguments for REQUEST; see `agent-notes-agents'.
 The first request creates the session with --session-id; later ones
 continue it with --resume.  Grok reads permission rules in the
-Claude Code syntax, and refuses --add-dir together with --resume, so
-the review's folder is added only when the session is created."
+Claude Code syntax.  It runs in the repository root, which holds
+the review's folder, so --add-dir is not needed; Grok 1.0.77 refuses
+it when creating a session."
   (let* ((session (plist-get request :session))
          (resume (or (plist-get request :resume) (agent-notes--grok-session-p session)))
          (allowed (delq nil (mapcar #'agent-notes--claude-tool agent-notes-allowed-tools)))
@@ -602,8 +603,7 @@ the review's folder is added only when the session is created."
     (append (list "--output-format" "plain")
             (if resume
                 (list "--resume" session)
-              (list "--session-id" session
-                    "--add-dir" (file-name-directory agent-notes--file)))
+              (list "--session-id" session))
             (list "--permission-mode" (if agent-notes-allow-edits "acceptEdits" "default"))
             (apply #'append (mapcar (lambda (rule) (list "--allow" rule)) allowed))
             (apply #'append (mapcar (lambda (rule) (list "--deny" rule)) denied))
