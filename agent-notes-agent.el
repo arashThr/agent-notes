@@ -120,6 +120,10 @@ when it is small enough; see `agent-notes-inline-diff-limit'."
      (agent-notes--new-side-prompt review)
      "The review itself is stored in " (file-name-directory agent-notes--file) ".\n"
      (agent-notes--permissions-prompt)
+     (if agent-notes-ignored-files
+         "Lock files and other generated files are left out of the diff on purpose; \
+don't open or review them.\n"
+       "")
      "\n" (agent-notes--files-prompt)
      (if include-diff (agent-notes--diff-prompt) ""))))
 

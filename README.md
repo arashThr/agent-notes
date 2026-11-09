@@ -238,7 +238,7 @@ sequenceDiagram
 
 - **Storage.** Every review is stored in `.git/agent-notes/<id>.json`, with a snapshot of the diff in `<id>.diff`. Nothing is committed. Git never pushes anything inside `.git/`, so reviews stay on your machine: other clones don't see them, and each clone or worktree has its own.
 - **Sessions.** Each review has its own session with the agent (see [Choosing the agent](#choosing-the-agent)), so the agent remembers the review when you reply.
-- **Context.** Every prompt gives the repository, the scope (base and head commits), the path of the diff snapshot, and the list of changed files with their `+`/`-` counts. For staged, commit and range reviews, the agent is also told that the working tree may differ from the diff, and how to read the diff's version of a file (`git show <commit>:<path>`).
+- **Context.** Every prompt gives the repository, the scope (base and head commits), the path of the diff snapshot, and the list of changed files with their `+`/`-` counts. Lock files (`agent-notes-ignored-files`) are left out of the diff, the file list and the snapshot, so they cost no tokens; a review made earlier drops them the next time it refreshes, and notes on them become outdated. For staged, commit and range reviews, the agent is also told that the working tree may differ from the diff, and how to read the diff's version of a file (`git show <commit>:<path>`).
   - **Tasks** also include the whole diff, if it is under `agent-notes-inline-diff-limit` characters (40000, about 10k tokens). That way no part of it gets skimmed. Larger diffs are left for the agent to read in parts, and it is told not to skip any file.
   - **Replies** include each thread with new messages, together with the code around it from the hunk: up to `agent-notes-thread-context-lines` lines on each side, with old and new line numbers.
   - **Files.** In both cases the agent can open whole files for more context.
@@ -261,6 +261,7 @@ sequenceDiagram
 - `agent-notes-tasks`: the tasks offered when giving the agent work
 - `agent-notes-extra-instructions`: guidance added to every task, such as the project's conventions
 - `agent-notes-inline-diff-limit`: the largest diff (in characters) put in a task's prompt; `nil` never includes it
+- `agent-notes-ignored-files`: globs of files left out of reviews (default: lock files such as `package-lock.json`, `yarn.lock`, `Cargo.lock`, `go.sum`); `nil` reviews every file
 - `agent-notes-thread-context-lines`: lines of code shown around each thread when replying
 - `agent-notes-allow-edits`: whether the agent may edit files
 - `agent-notes-allowed-tools`, `agent-notes-denied-tools`: what the agent may run, and what it must not (see the table in [Choosing the agent](#choosing-the-agent))

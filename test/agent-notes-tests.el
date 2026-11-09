@@ -905,6 +905,51 @@ It runs SHELL, prints ANSWER and ignores its arguments."
 
 ;;;; Diff sources
 
+(ert-deftest agent-notes-test-ignored-files ()
+  (agent-notes-tests--with-repo
+    (make-directory "web")
+    (agent-notes--write-file "package-lock.json" "{}\n")
+    (agent-notes--write-file "web/yarn.lock" "a\n")
+    (agent-notes--git "add" "package-lock.json" "web")
+    (agent-notes--git "-c" "commit.gpgsign=false" "commit" "-q" "--no-verify" "-m" "locks")
+    ;; Changed lock files, tracked and nested; new ones, untracked; and a
+    ;; new file that is not a lock file.
+    (agent-notes--write-file "package-lock.json" "{\"a\":1}\n")
+    (agent-notes--write-file "web/yarn.lock" "b\n")
+    (agent-notes--write-file "go.sum" "x\n")
+    (agent-notes--write-file "notes.txt" "keep\n")
+    (cl-flet ((diff (scope &optional base) (car (agent-notes--make-diff scope base)))
+              (has (diff file) (string-search (concat "b/" file "\n") (concat diff "\n"))))
+      (let ((working (diff "working")))
+        (should (has working "src/auth.py"))
+        (should (has working "notes.txt"))
+        (should-not (has working "package-lock.json"))
+        (should-not (has working "web/yarn.lock"))
+        (should-not (has working "go.sum")))
+      ;; Every kind of diff leaves them out, including the files of a commit.
+      (agent-notes--git "add" "-A")
+      (let ((staged (diff "staged")))
+        (should (has staged "notes.txt"))
+        (should-not (has staged "package-lock.json"))
+        (should-not (has staged "go.sum")))
+      (agent-notes--git "-c" "commit.gpgsign=false" "commit" "-q" "--no-verify" "-m" "more")
+      (let ((commit (diff "commit" "HEAD")))
+        (should (has commit "notes.txt"))
+        (should-not (has commit "package-lock.json"))
+        (should-not (has commit "web/yarn.lock")))
+      ;; The prompt says so, and nil reviews every file.
+      (should (string-search "left out of the diff on purpose" (agent-notes--context-prompt)))
+      (let ((agent-notes-ignored-files nil))
+        (should (has (diff "commit" "HEAD") "package-lock.json"))
+        (should (has (diff "commit" "HEAD") "go.sum"))
+        (should-not (string-search "left out of the diff on purpose"
+                                   (agent-notes--context-prompt))))
+      ;; Custom patterns match by name, in every directory.
+      (let ((agent-notes-ignored-files '("*.txt" "web/**")))
+        (should-not (has (diff "commit" "HEAD") "notes.txt"))
+        (should-not (has (diff "commit" "HEAD") "web/yarn.lock"))
+        (should (has (diff "commit" "HEAD") "package-lock.json"))))))
+
 (ert-deftest agent-notes-test-ranges-and-labels ()
   (should (equal (agent-notes--parse-range "main..feature") '("main" "feature" nil)))
   (should (equal (agent-notes--parse-range "main...feature") '("main" "feature" t)))

@@ -55,19 +55,28 @@
   '("-c" "core.quotepath=false" "diff" "--no-color" "--no-ext-diff"
     "-M" "--src-prefix=a/" "--dst-prefix=b/"))
 
+(defun agent-notes--ignored-pathspecs ()
+  "Return git pathspecs excluding `agent-notes-ignored-files'."
+  (mapcar (lambda (glob) (concat ":(exclude,glob)**/" glob))
+          agent-notes-ignored-files))
+
 (defun agent-notes--git-diff (&rest revs)
-  "Return the diff between REVS (or REV and the working tree)."
-  (apply #'agent-notes--git (append (agent-notes--diff-args) revs '("--"))))
+  "Return the diff between REVS (or REV and the working tree).
+Files in `agent-notes-ignored-files' are left out."
+  (apply #'agent-notes--git (append (agent-notes--diff-args) revs '("--")
+                                    (agent-notes--ignored-pathspecs))))
 
 (defun agent-notes--untracked-diff ()
-  "Return a diff that adds every untracked, non-ignored file."
+  "Return a diff that adds every untracked, non-ignored file.
+Files in `agent-notes-ignored-files' are left out."
   (mapconcat
    (lambda (file)
      (or (agent-notes--git-call
           '(0 1) (append (agent-notes--diff-args)
                          (list "--no-index" "--" "/dev/null" file)))
          ""))
-   (split-string (agent-notes--git "ls-files" "-z" "--others" "--exclude-standard")
+   (split-string (apply #'agent-notes--git "ls-files" "-z" "--others" "--exclude-standard"
+                        "--" "." (agent-notes--ignored-pathspecs))
                  "\0" t)
    ""))
 

@@ -193,6 +193,25 @@ agent cannot skip parts of it.  Larger diffs, about 4 characters per
 token, are left for the agent to read.  nil never includes the diff."
   :type '(choice (const :tag "Never" nil) integer))
 
+(defcustom agent-notes-ignored-files
+  '("package-lock.json" "npm-shrinkwrap.json" "yarn.lock" "pnpm-lock.yaml"
+    "bun.lock" "bun.lockb" "deno.lock"
+    "Cargo.lock" "go.sum" "go.work.sum"
+    "poetry.lock" "uv.lock" "pdm.lock" "Pipfile.lock"
+    "Gemfile.lock" "composer.lock" "mix.lock" "pubspec.lock"
+    "Podfile.lock" "Package.resolved" "flake.lock" "gradle.lockfile"
+    "packages.lock.json" ".terraform.lock.hcl" "renv.lock" "Chart.lock"
+    "conan.lock" "stack.yaml.lock" "cabal.project.freeze")
+  "Files left out of reviews, as glob patterns matched in every directory.
+The defaults are lock files: they are generated, long, and cost a
+lot of tokens for little to review.  They are left out of the diff
+that is shown and sent to the agent, so they are not in its list of
+changed files either.  Each pattern is a git glob matched in every
+directory, so \"*.lock\" matches by file name and \"docs/**\" a
+directory.  Set it to nil to review every file.  A change takes
+effect for new reviews, and for existing ones when they refresh."
+  :type '(repeat (string :tag "Glob")))
+
 (defcustom agent-notes-thread-context-lines 8
   "Lines of the diff shown around a thread's line when replying.
 When you send comments, each thread is given to the agent with up
