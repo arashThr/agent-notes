@@ -1027,7 +1027,11 @@ It runs SHELL, prints ANSWER and ignores its arguments."
         (should-not (member "--resume" args))
         (should (equal (cadr (member "--allow" args)) "Bash(git diff:*)"))
         (should (member "Edit" args))
-        (should (equal (cadr (member "--permission-mode" args)) "default"))
+        ;; Grok rejects tools it doesn't have, such as NotebookEdit.
+        (should-not (member "NotebookEdit" args))
+        (should-not (member "MultiEdit" args))
+        ;; Headless Grok cancels the turn when it would have to ask.
+        (should (equal (cadr (member "--permission-mode" args)) "dontAsk"))
         (should (equal (last args 2) '("-p" "p"))))
       (let* ((agent-notes-allow-edits t)
              (args (agent-notes--grok-args '(:prompt "p" :session "s1" :resume t))))
@@ -1035,7 +1039,14 @@ It runs SHELL, prints ANSWER and ignores its arguments."
         (should-not (member "--session-id" args))
         (should-not (member "--add-dir" args))
         (should-not (member "--deny" args))
-        (should (equal (cadr (member "--permission-mode" args)) "acceptEdits"))))
+        (should (equal (cadr (member "--permission-mode" args)) "dontAsk"))
+        ;; With edits allowed, the edit tools are allowed by rule.
+        (should (cl-loop for (flag rule) on args
+                         thereis (and (equal flag "--allow") (equal rule "Edit"))))
+        (should (cl-loop for (flag rule) on args
+                         thereis (and (equal flag "--allow") (equal rule "Write"))))
+        (should-not (member "NotebookEdit" args))
+        (should-not (member "MultiEdit" args))))
     (let* ((home (make-temp-file "agent-notes-grok" t))
            (process-environment (cons (concat "GROK_HOME=" home) process-environment)))
       (unwind-protect

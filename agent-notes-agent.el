@@ -588,23 +588,34 @@ session with --session-id; later ones continue it with --resume."
     (and (stringp session) (file-directory-p dir)
          (file-expand-wildcards (expand-file-name (concat "*/" session) dir)))))
 
+(defconst agent-notes--grok-edit-tools '("Edit" "Write")
+  "The Grok tools that change files.
+Grok rejects names it has no tool for, such as NotebookEdit.")
+
 (defun agent-notes--grok-args (request)
   "Return the Grok arguments for REQUEST; see `agent-notes-agents'.
 The first request creates the session with --session-id; later ones
 continue it with --resume.  Grok reads permission rules in the
 Claude Code syntax.  It runs in the repository root, which holds
 the review's folder, so --add-dir is not needed; Grok 1.0.77 refuses
-it when creating a session."
+it when creating a session.
+
+Grok cannot ask for approval in headless mode: a call that would
+need it cancels the whole turn, and no answer comes back.  So it
+runs in dontAsk mode, which denies such calls and lets the agent
+carry on, and the edit tools are allowed by rule when
+`agent-notes-allow-edits' is non-nil."
   (let* ((session (plist-get request :session))
          (resume (or (plist-get request :resume) (agent-notes--grok-session-p session)))
-         (allowed (delq nil (mapcar #'agent-notes--claude-tool agent-notes-allowed-tools)))
+         (allowed (append (delq nil (mapcar #'agent-notes--claude-tool agent-notes-allowed-tools))
+                          (and agent-notes-allow-edits agent-notes--grok-edit-tools)))
          (denied (append (delq nil (mapcar #'agent-notes--claude-tool agent-notes-denied-tools))
-                         (unless agent-notes-allow-edits agent-notes--claude-edit-tools))))
+                         (unless agent-notes-allow-edits agent-notes--grok-edit-tools))))
     (append (list "--output-format" "plain")
             (if resume
                 (list "--resume" session)
               (list "--session-id" session))
-            (list "--permission-mode" (if agent-notes-allow-edits "acceptEdits" "default"))
+            (list "--permission-mode" "dontAsk")
             (apply #'append (mapcar (lambda (rule) (list "--allow" rule)) allowed))
             (apply #'append (mapcar (lambda (rule) (list "--deny" rule)) denied))
             agent-notes-grok-extra-args

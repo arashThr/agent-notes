@@ -106,7 +106,10 @@ least one review, e.g. `/tmp/an-demo4/`):
   Grok was checked against `grok --help` and its headless docs (1.0.67), also
   only with a fake script. Don't pass it `--add-dir`: Grok 1.0.77 fails to
   create the session ("additionalDirectories is not supported"). It runs in
-  the repository root, which contains `.git/agent-notes`.
+  the repository root, which contains `.git/agent-notes`. Headless Grok
+  cancels the whole turn when a tool call needs approval (no answer comes
+  back), so it runs with `--permission-mode dontAsk` and allows the edit
+  tools by rule.
 - Posting to GitHub is user-initiated (`G`); the agent only drafts text in a
   reply's `github` field (`:github_draft`) and never runs `gh`. It goes through `agent-notes--gh`,
   which takes a list of argv strings (no shell). Tests stub that function; never
